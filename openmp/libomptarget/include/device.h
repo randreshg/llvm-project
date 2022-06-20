@@ -345,7 +345,8 @@ struct DeviceTy {
   /// \c OFFLOAD_FAIL if not.  It is the caller's responsibility to skip calling
   /// this function if the map entry is not expected to exist because
   /// \p HstPtrBegin uses shared memory.
-  int deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool HasHoldModifier);
+  int deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool HasHoldModifier,
+                    AsyncInfoTy &AsyncInfo);
   int associatePtr(void *HstPtrBegin, void *TgtPtrBegin, int64_t Size);
   int disassociatePtr(void *HstPtrBegin);
 

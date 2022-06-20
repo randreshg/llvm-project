@@ -413,9 +413,14 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
 }
 
 int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size,
-                            bool HasHoldModifier) {
-  // Check if the pointer is contained in any sub-nodes.
+                            bool HasHoldModifier, AsyncInfoTy &AsyncInfo) {
   int Ret = OFFLOAD_SUCCESS;
+  // We need to synchronize before deallocating data.
+  Ret = AsyncInfo.synchronize();
+  if (Ret != OFFLOAD_SUCCESS)
+    return OFFLOAD_FAIL;
+
+  // Check if the pointer is contained in any sub-nodes.
   DataMapMtx.lock();
   LookupResult lr = lookupMapping(HstPtrBegin, Size);
   if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) {

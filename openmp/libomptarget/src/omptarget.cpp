@@ -825,20 +825,20 @@ int targetDataEnd(ident_t *loc, DeviceTy &Device, int32_t ArgNum,
     }
   }
 
-  // TODO: We should not synchronize here but pass the AsyncInfo object to the
-  //       allocate/deallocate device APIs.
-  //
-  // We need to synchronize before deallocating data.
-  Ret = AsyncInfo.synchronize();
-  if (Ret != OFFLOAD_SUCCESS)
-    return OFFLOAD_FAIL;
+  // // TODO: We should not synchronize here but pass the AsyncInfo object to the
+  // //       allocate/deallocate device APIs.
+  // //
+  // // We need to synchronize before deallocating data.
+  // Ret = AsyncInfo.synchronize();
+  // if (Ret != OFFLOAD_SUCCESS)
+  //   return OFFLOAD_FAIL;
 
   // Deallocate target pointer
   for (DeallocTgtPtrInfo &Info : DeallocTgtPtrs) {
     if (FromMapperBase && FromMapperBase == Info.HstPtrBegin)
       continue;
     Ret = Device.deallocTgtPtr(Info.HstPtrBegin, Info.DataSize,
-                               Info.HasHoldModifier);
+                               Info.HasHoldModifier, AsyncInfo);
     if (Ret != OFFLOAD_SUCCESS) {
       REPORT("Deallocating data from device failed.\n");
       return OFFLOAD_FAIL;
