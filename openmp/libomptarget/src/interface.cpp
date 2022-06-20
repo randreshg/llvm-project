@@ -311,8 +311,8 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, 0, 0, false /*team*/,
                   AsyncInfo);
-  if (rc == OFFLOAD_SUCCESS)
-    rc = AsyncInfo.synchronize();
+  // if (rc == OFFLOAD_SUCCESS)
+  //   rc = AsyncInfo.synchronize();
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS && "__tgt_target_mapper unexpected failure!");
   return OMP_TGT_SUCCESS;
@@ -385,8 +385,8 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, team_num, thread_limit,
                   true /*team*/, AsyncInfo);
-  if (rc == OFFLOAD_SUCCESS)
-    rc = AsyncInfo.synchronize();
+  // if (rc == OFFLOAD_SUCCESS)
+  //   rc = AsyncInfo.synchronize();
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS &&
          "__tgt_target_teams_mapper unexpected failure!");
