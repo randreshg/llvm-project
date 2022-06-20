@@ -248,6 +248,7 @@ EXTERN void __tgt_target_data_update_mapper(ident_t *loc, int64_t device_id,
                             arg_types, arg_names, arg_mappers, AsyncInfo);
   if (rc == OFFLOAD_SUCCESS)
     rc = AsyncInfo.synchronize();
+  delete &AsyncInfo;
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
 }
 

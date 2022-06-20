@@ -832,7 +832,6 @@ int targetDataEnd(ident_t *loc, DeviceTy &Device, int32_t ArgNum,
   // Ret = AsyncInfo.synchronize();
   // if (Ret != OFFLOAD_SUCCESS)
   //   return OFFLOAD_FAIL;
-
   // Deallocate target pointer
   for (DeallocTgtPtrInfo &Info : DeallocTgtPtrs) {
     if (FromMapperBase && FromMapperBase == Info.HstPtrBegin)
