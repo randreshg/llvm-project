@@ -218,12 +218,6 @@ EXTERN void __tgt_target_data_update_nowait(
                                   arg_sizes, arg_types, nullptr, nullptr);
 }
 
-AsyncInfoTy *getAsyncInfo(DeviceTy &Device) {
-  static thread_local AsyncInfoTy *AsyncInfo = nullptr;
-  if(!AsyncInfo) 
-    AsyncInfo = new AsyncInfoTy(Device);
-  return AsyncInfo;
-}
 
 EXTERN void __tgt_target_data_update_mapper(ident_t *loc, int64_t device_id,
                                             int32_t arg_num, void **args_base,
@@ -243,12 +237,12 @@ EXTERN void __tgt_target_data_update_mapper(ident_t *loc, int64_t device_id,
                          arg_names, "Updating OpenMP data");
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = *getAsyncInfo(Device);
+  AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
   int rc = targetDataUpdate(loc, Device, arg_num, args_base, args, arg_sizes,
                             arg_types, arg_names, arg_mappers, AsyncInfo);
   if (rc == OFFLOAD_SUCCESS)
     rc = AsyncInfo.synchronize();
-  delete &AsyncInfo;
+  Device.freeAsyncInfo();
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
 }
 
@@ -308,7 +302,7 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
 #endif
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = *getAsyncInfo(Device);
+  AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, 0, 0, false /*team*/,
                   AsyncInfo);
@@ -382,10 +376,14 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
 #endif
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = *getAsyncInfo(Device);
+  AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, team_num, thread_limit,
                   true /*team*/, AsyncInfo);
+  // if no stream
+  //if(!AsyncInfo.AsyncInfo.Queue)
+  //  Device.freeAsyncInfo();
+
   // if (rc == OFFLOAD_SUCCESS)
   //   rc = AsyncInfo.synchronize();
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
