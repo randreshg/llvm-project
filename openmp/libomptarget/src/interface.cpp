@@ -273,13 +273,13 @@ EXTERN int __tgt_target_nowait(int64_t device_id, void *host_ptr,
   TIMESCOPE();
 
   return __tgt_target_mapper(nullptr, device_id, host_ptr, arg_num, args_base,
-                             args, arg_sizes, arg_types, nullptr, nullptr);
+                             args, arg_sizes, arg_types, nullptr, nullptr, true);
 }
 
 EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
                                int32_t arg_num, void **args_base, void **args,
                                int64_t *arg_sizes, int64_t *arg_types,
-                               map_var_info_t *arg_names, void **arg_mappers) {
+                               map_var_info_t *arg_names, void **arg_mappers, bool nowait) {
   TIMESCOPE_WITH_IDENT(loc);
   DP("Entering target region with entry point " DPxMOD " and device Id %" PRId64
      "\n",
@@ -302,12 +302,15 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
 #endif
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
+  AsyncInfoTy &AsyncInfo = nowait?*(new AsyncInfoTy(Device)):*Device.getAsyncInfo();
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, 0, 0, false /*team*/,
                   AsyncInfo);
-  // if (rc == OFFLOAD_SUCCESS)
-  //   rc = AsyncInfo.synchronize();
+  if(nowait) {
+    if (rc == OFFLOAD_SUCCESS)
+      rc = AsyncInfo.synchronize();
+    delete &AsyncInfo;
+  }
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS && "__tgt_target_mapper unexpected failure!");
   return OMP_TGT_SUCCESS;
@@ -321,7 +324,7 @@ EXTERN int __tgt_target_nowait_mapper(
   TIMESCOPE_WITH_IDENT(loc);
 
   return __tgt_target_mapper(loc, device_id, host_ptr, arg_num, args_base, args,
-                             arg_sizes, arg_types, arg_names, arg_mappers);
+                             arg_sizes, arg_types, arg_names, arg_mappers, true);
 }
 
 EXTERN int __tgt_target_teams(int64_t device_id, void *host_ptr,
@@ -380,10 +383,6 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, team_num, thread_limit,
                   true /*team*/, AsyncInfo);
-  // if no stream
-  //if(!AsyncInfo.AsyncInfo.Queue)
-  //  Device.freeAsyncInfo();
-
   // if (rc == OFFLOAD_SUCCESS)
   //   rc = AsyncInfo.synchronize();
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
@@ -402,7 +401,7 @@ EXTERN int __tgt_target_teams_nowait_mapper(
 
   return __tgt_target_teams_mapper(loc, device_id, host_ptr, arg_num, args_base,
                                    args, arg_sizes, arg_types, arg_names,
-                                   arg_mappers, team_num, thread_limit);
+                                   arg_mappers, team_num, thread_limit, true);
 }
 
 // Get the current number of components for a user-defined mapper.
