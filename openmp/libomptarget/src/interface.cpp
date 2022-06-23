@@ -348,7 +348,7 @@ EXTERN int __tgt_target_teams_nowait(int64_t device_id, void *host_ptr,
 
   return __tgt_target_teams_mapper(nullptr, device_id, host_ptr, arg_num,
                                    args_base, args, arg_sizes, arg_types,
-                                   nullptr, nullptr, team_num, thread_limit);
+                                   nullptr, nullptr, team_num, thread_limit, true);
 }
 
 EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
@@ -357,7 +357,7 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
                                      int64_t *arg_sizes, int64_t *arg_types,
                                      map_var_info_t *arg_names,
                                      void **arg_mappers, int32_t team_num,
-                                     int32_t thread_limit) {
+                                     int32_t thread_limit, bool nowait) {
   DP("Entering target region with entry point " DPxMOD " and device Id %" PRId64
      "\n",
      DPxPTR(host_ptr), device_id);
@@ -379,12 +379,15 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
 #endif
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
+  AsyncInfoTy &AsyncInfo = nowait?*(new AsyncInfoTy(Device)):*Device.getAsyncInfo();
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, team_num, thread_limit,
                   true /*team*/, AsyncInfo);
-  // if (rc == OFFLOAD_SUCCESS)
-  //   rc = AsyncInfo.synchronize();
+  if(nowait) {
+    if (rc == OFFLOAD_SUCCESS)
+      rc = AsyncInfo.synchronize();
+    delete &AsyncInfo;
+  }
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS &&
          "__tgt_target_teams_mapper unexpected failure!");

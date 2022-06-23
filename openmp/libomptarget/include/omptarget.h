@@ -323,7 +323,7 @@ int __tgt_target_nowait(int64_t device_id, void *host_ptr, int32_t arg_num,
 int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
                         int32_t arg_num, void **args_base, void **args,
                         int64_t *arg_sizes, int64_t *arg_types,
-                        map_var_info_t *arg_names, void **arg_mappers, bool async=false);
+                        map_var_info_t *arg_names, void **arg_mappers, bool nowait=false);
 int __tgt_target_nowait_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
                                int32_t arg_num, void **args_base, void **args,
                                int64_t *arg_sizes, int64_t *arg_types,
@@ -345,7 +345,7 @@ int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
                               int32_t arg_num, void **args_base, void **args,
                               int64_t *arg_sizes, int64_t *arg_types,
                               map_var_info_t *arg_names, void **arg_mappers,
-                              int32_t num_teams, int32_t thread_limit);
+                              int32_t num_teams, int32_t thread_limit, bool nowait=false);
 int __tgt_target_teams_nowait_mapper(
     ident_t *loc, int64_t device_id, void *host_ptr, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types,
