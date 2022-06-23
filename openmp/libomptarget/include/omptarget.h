@@ -169,7 +169,7 @@ class AsyncInfoTy {
 
 public:
   AsyncInfoTy(DeviceTy &Device) : Device(Device) {}
-  ~AsyncInfoTy() { synchronize(); }
+  ~AsyncInfoTy() {} //synchronize();
 
   /// Implicit conversion to the __tgt_async_info which is used in the
   /// plugin interface.
@@ -323,7 +323,7 @@ int __tgt_target_nowait(int64_t device_id, void *host_ptr, int32_t arg_num,
 int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
                         int32_t arg_num, void **args_base, void **args,
                         int64_t *arg_sizes, int64_t *arg_types,
-                        map_var_info_t *arg_names, void **arg_mappers);
+                        map_var_info_t *arg_names, void **arg_mappers, bool async=false);
 int __tgt_target_nowait_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
                                int32_t arg_num, void **args_base, void **args,
                                int64_t *arg_sizes, int64_t *arg_types,
