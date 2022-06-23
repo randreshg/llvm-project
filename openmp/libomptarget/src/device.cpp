@@ -47,14 +47,12 @@ int HostDataToTargetTy::addEventIfNecessary(
 }
 
 DeviceTy::DeviceTy(RTLInfoTy *RTL)
-    : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), AsyncInfo(NULL), IsInit(false), InitFlag(),
+    : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), AsyncInfo(nullptr), IsInit(false), InitFlag(),
       HasPendingGlobals(false), HostDataToTargetMap(), PendingCtorsDtors(),
       ShadowPtrMap(), DataMapMtx(), PendingGlobalsMtx(), ShadowMtx() {}
 
 DeviceTy::~DeviceTy() {
-  //printf("OK \n");
-  //TODO: Thread safe?
-  //freeAsyncInfo();
+  freeAsyncInfo();
   if (DeviceID == -1 || !(getInfoLevel() & OMP_INFOTYPE_DUMP_TABLE))
     return;
   ident_t loc = {0, 0, 0, 0, ";libomptarget;libomptarget;0;0;;"};

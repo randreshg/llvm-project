@@ -313,7 +313,7 @@ struct DeviceTy {
 
   ~DeviceTy();
 
-  //
+
   AsyncInfoTy *getAsyncInfo() {
     if(!AsyncInfo)
       AsyncInfo = new AsyncInfoTy(*this);
@@ -321,8 +321,10 @@ struct DeviceTy {
   }
 
   void freeAsyncInfo() {
-    if(AsyncInfo)
+    if(AsyncInfo) {
       delete AsyncInfo;
+      AsyncInfo = nullptr;
+    }
   }
 
   // Return true if data can be copied to DstDevice directly
