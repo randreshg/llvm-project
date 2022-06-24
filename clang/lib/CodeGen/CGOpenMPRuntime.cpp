@@ -10463,6 +10463,10 @@ void CGOpenMPRuntime::emitTargetCall(
         OffloadingArgs.push_back(CGF.Builder.getInt32(0));
         OffloadingArgs.push_back(llvm::ConstantPointerNull::get(CGM.VoidPtrTy));
       }
+      else {
+        //Asyncinfo
+        OffloadingArgs.push_back(CGF.Builder.getFalse());
+      }
       Return = CGF.EmitRuntimeCall(
           OMPBuilder.getOrCreateRuntimeFunction(
               CGM.getModule(), HasNowait ? OMPRTL___tgt_target_nowait_mapper

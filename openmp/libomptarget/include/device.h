@@ -315,13 +315,19 @@ struct DeviceTy {
 
 
   AsyncInfoTy *getAsyncInfo() {
-    if(!AsyncInfo)
+    if(!AsyncInfo) {
       AsyncInfo = new AsyncInfoTy(*this);
+      printf("----------------New ASyncinfo\n");
+    }
+    else{
+      printf("----------------Same ASyncinfo\n");
+    }
     return AsyncInfo;
   }
 
   void freeAsyncInfo() {
     if(AsyncInfo) {
+      printf("----------------AsyncInfo deleted\n");
       delete AsyncInfo;
       AsyncInfo = nullptr;
     }
