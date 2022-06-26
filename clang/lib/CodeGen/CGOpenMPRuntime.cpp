@@ -10437,6 +10437,10 @@ void CGOpenMPRuntime::emitTargetCall(
         OffloadingArgs.push_back(CGF.Builder.getInt32(0));
         OffloadingArgs.push_back(llvm::ConstantPointerNull::get(CGM.VoidPtrTy));
       }
+      else {
+        //Nowait
+        OffloadingArgs.push_back(CGF.Builder.getFalse());
+      }
       Return = CGF.EmitRuntimeCall(
           OMPBuilder.getOrCreateRuntimeFunction(
               CGM.getModule(), HasNowait
@@ -10464,7 +10468,7 @@ void CGOpenMPRuntime::emitTargetCall(
         OffloadingArgs.push_back(llvm::ConstantPointerNull::get(CGM.VoidPtrTy));
       }
       else {
-        //Asyncinfo
+        //Nowait
         OffloadingArgs.push_back(CGF.Builder.getFalse());
       }
       Return = CGF.EmitRuntimeCall(
@@ -11347,17 +11351,16 @@ void CGOpenMPRuntime::emitTargetDataStandAloneCall(
 
     // Source location for the ident struct
     llvm::Value *RTLoc = emitUpdateLocation(CGF, D.getBeginLoc());
-
-    llvm::Value *OffloadingArgs[] = {RTLoc,
-                                     DeviceID,
-                                     PointerNum,
-                                     InputInfo.BasePointersArray.getPointer(),
-                                     InputInfo.PointersArray.getPointer(),
-                                     InputInfo.SizesArray.getPointer(),
-                                     MapTypesArray,
-                                     MapNamesArray,
-                                     InputInfo.MappersArray.getPointer()};
-
+    SmallVector<llvm::Value *> OffloadingArgs = {
+      RTLoc,
+      DeviceID,
+      PointerNum,
+      InputInfo.BasePointersArray.getPointer(),
+      InputInfo.PointersArray.getPointer(),
+      InputInfo.SizesArray.getPointer(),
+      MapTypesArray,
+      MapNamesArray,
+      InputInfo.MappersArray.getPointer()};
     // Select the right runtime function call for each standalone
     // directive.
     const bool HasNowait = D.hasClausesOfKind<OMPNowaitClause>();
@@ -11371,7 +11374,7 @@ void CGOpenMPRuntime::emitTargetDataStandAloneCall(
       RTLFn = HasNowait ? OMPRTL___tgt_target_data_end_nowait_mapper
                         : OMPRTL___tgt_target_data_end_mapper;
       break;
-    case OMPD_target_update:
+    case OMPD_target_update: 
       RTLFn = HasNowait ? OMPRTL___tgt_target_data_update_nowait_mapper
                         : OMPRTL___tgt_target_data_update_mapper;
       break;
