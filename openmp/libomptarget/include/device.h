@@ -289,7 +289,7 @@ struct DeviceTy {
   int32_t DeviceID;
   RTLInfoTy *RTL;
   int32_t RTLDeviceID;
-  AsyncInfoTy *AsyncInfo;
+  static thread_local std::unique_ptr<AsyncInfoTy> AsyncInfo;
 
   bool IsInit;
   std::once_flag InitFlag;
@@ -312,6 +312,24 @@ struct DeviceTy {
   DeviceTy &operator=(const DeviceTy &D) = delete;
 
   ~DeviceTy();
+
+  //Asyncinfo
+  AsyncInfoTy *getAsyncInfo() {
+    if (!AsyncInfo) {
+      printf("----------------New Asyncinfo\n");
+      AsyncInfo = std::make_unique<AsyncInfoTy>(*this);
+    }
+    else{
+      printf("----------------Same Asyncinfo\n");
+    }
+    return AsyncInfo.get();
+  }
+
+  void freeAsyncInfo() {
+    printf("----------------Free Asyncinfo\n");
+    AsyncInfo.reset();
+    AsyncInfo = nullptr;
+  }
 
   // Return true if data can be copied to DstDevice directly
   bool isDataExchangable(const DeviceTy &DstDevice);
