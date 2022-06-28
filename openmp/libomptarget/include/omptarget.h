@@ -17,6 +17,7 @@
 #include <deque>
 #include <stddef.h>
 #include <stdint.h>
+#include <assert.h>
 
 #include <SourceInfo.h>
 
@@ -168,8 +169,8 @@ class AsyncInfoTy {
   DeviceTy &Device;
 
 public:
-  AsyncInfoTy(DeviceTy &Device) : Device(Device) {}
-  ~AsyncInfoTy() {} //synchronize();
+  AsyncInfoTy(DeviceTy &Device) : Device(Device) { printf("----------------Asyncinfo Constructor\n"); }
+  ~AsyncInfoTy() { printf("----------------Asyncinfo Destructor\n"); } //synchronize();
 
   /// Implicit conversion to the __tgt_async_info which is used in the
   /// plugin interface.

@@ -52,7 +52,6 @@ DeviceTy::DeviceTy(RTLInfoTy *RTL)
       ShadowPtrMap(), DataMapMtx(), PendingGlobalsMtx(), ShadowMtx() {}
 
 DeviceTy::~DeviceTy() {
-  freeAsyncInfo();
   if (DeviceID == -1 || !(getInfoLevel() & OMP_INFOTYPE_DUMP_TABLE))
     return;
   ident_t loc = {0, 0, 0, 0, ";libomptarget;libomptarget;0;0;;"};
@@ -660,7 +659,6 @@ bool device_is_ready(int device_num) {
 
   DP("Is the device %d (local ID %d) initialized? %d\n", device_num,
      Device.RTLDeviceID, Device.IsInit);
-
   // Init the device if not done before
   if (!Device.IsInit && Device.initOnce() != OFFLOAD_SUCCESS) {
     DP("Failed to init device %d\n", device_num);

@@ -560,7 +560,9 @@ public:
 
   ~DeviceRTLTy() {
     // Synchronize device
+    printf("----------------Synchronize device\n");
     cuCtxSynchronize();
+    printf("----------------Synchronize device done\n");
     // We first destruct memory managers in case that its dependent data are
     // destroyed before it.
     for (auto &M : MemoryManagers)
@@ -606,7 +608,6 @@ public:
     CUresult Err = cuDeviceGet(&Device, DeviceId);
     if (!checkResult(Err, "Error returned from cuDeviceGet\n"))
       return OFFLOAD_FAIL;
-
     // Query the current flags of the primary context and set its flags if
     // it is inactive
     unsigned int FormerPrimaryCtxFlags = 0;
@@ -638,7 +639,6 @@ public:
     Err = cuCtxSetCurrent(DeviceData[DeviceId].Context);
     if (!checkResult(Err, "Error returned from cuCtxSetCurrent\n"))
       return OFFLOAD_FAIL;
-
     // Initialize stream pool
     if (!StreamPool[DeviceId])
       StreamPool[DeviceId] = std::make_unique<StreamPoolTy>(

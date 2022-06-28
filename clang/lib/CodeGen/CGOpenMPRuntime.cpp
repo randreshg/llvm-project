@@ -11351,16 +11351,15 @@ void CGOpenMPRuntime::emitTargetDataStandAloneCall(
 
     // Source location for the ident struct
     llvm::Value *RTLoc = emitUpdateLocation(CGF, D.getBeginLoc());
-    SmallVector<llvm::Value *> OffloadingArgs = {
-      RTLoc,
-      DeviceID,
-      PointerNum,
-      InputInfo.BasePointersArray.getPointer(),
-      InputInfo.PointersArray.getPointer(),
-      InputInfo.SizesArray.getPointer(),
-      MapTypesArray,
-      MapNamesArray,
-      InputInfo.MappersArray.getPointer()};
+    llvm::Value *OffloadingArgs[] = {RTLoc,
+                                     DeviceID,
+                                     PointerNum,
+                                     InputInfo.BasePointersArray.getPointer(),
+                                     InputInfo.PointersArray.getPointer(),
+                                     InputInfo.SizesArray.getPointer(),
+                                     MapTypesArray,
+                                     MapNamesArray,
+                                     InputInfo.MappersArray.getPointer()};
     // Select the right runtime function call for each standalone
     // directive.
     const bool HasNowait = D.hasClausesOfKind<OMPNowaitClause>();

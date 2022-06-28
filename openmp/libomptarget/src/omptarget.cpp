@@ -21,6 +21,7 @@
 #include <vector>
 
 int AsyncInfoTy::synchronize() {
+  printf("Synchronizing....\n");
   int Result = OFFLOAD_SUCCESS;
   if (AsyncInfo.Queue) {
     // If we have a queue we need to synchronize it now.
@@ -289,27 +290,23 @@ bool checkDeviceAndCtors(int64_t &DeviceID, ident_t *Loc) {
     DeviceID = omp_get_default_device();
     DP("Use default device id %" PRId64 "\n", DeviceID);
   }
-
   // Proposed behavior for OpenMP 5.2 in OpenMP spec github issue 2669.
   if (omp_get_num_devices() == 0) {
     DP("omp_get_num_devices() == 0 but offload is manadatory\n");
     handleTargetOutcome(false, Loc);
     return true;
   }
-
   if (DeviceID == omp_get_initial_device()) {
     DP("Device is host (%" PRId64 "), returning as if offload is disabled\n",
        DeviceID);
     return true;
   }
-
   // Is device ready?
   if (!device_is_ready(DeviceID)) {
     REPORT("Device %" PRId64 " is not ready.\n", DeviceID);
     handleTargetOutcome(false, Loc);
     return true;
   }
-
   // Get device info.
   DeviceTy &Device = *PM->Devices[DeviceID];
 

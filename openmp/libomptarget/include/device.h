@@ -313,26 +313,6 @@ struct DeviceTy {
 
   ~DeviceTy();
 
-
-  AsyncInfoTy *getAsyncInfo() {
-    if(!AsyncInfo) {
-      AsyncInfo = new AsyncInfoTy(*this);
-      printf("----------------New ASyncinfo\n");
-    }
-    else{
-      printf("----------------Same ASyncinfo\n");
-    }
-    return AsyncInfo;
-  }
-
-  void freeAsyncInfo() {
-    if(AsyncInfo) {
-      printf("----------------AsyncInfo deleted\n");
-      delete AsyncInfo;
-      AsyncInfo = nullptr;
-    }
-  }
-
   // Return true if data can be copied to DstDevice directly
   bool isDataExchangable(const DeviceTy &DstDevice);
 

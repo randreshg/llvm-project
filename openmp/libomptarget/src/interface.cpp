@@ -61,6 +61,46 @@ EXTERN void __tgt_unregister_lib(__tgt_bin_desc *desc) {
   }
 }
 
+namespace {
+  static thread_local std::unique_ptr<AsyncInfoTy> AsyncInfo = nullptr;
+
+    AsyncInfoTy *getAsyncInfo(DeviceTy &Device) {
+        if (!AsyncInfo) {
+          printf("----------------New Asyncinfo\n");
+          AsyncInfo = std::make_unique<AsyncInfoTy>(Device);
+        }
+      else{
+        printf("----------------Same Asyncinfo\n");
+      }
+        return AsyncInfo.get();
+    }
+
+    void freeAsyncInfo() {
+      printf("----------------Free Asyncinfo\n");
+        AsyncInfo.reset();
+        AsyncInfo = nullptr;
+    }
+
+  // AsyncInfoTy *getAsyncInfo() {
+  //   if(!AsyncInfo) {
+  //     AsyncInfo = new AsyncInfoTy(*this);
+  //     printf("----------------New ASyncinfo\n");
+  //   }
+  //   else{
+  //     printf("----------------Same Asyncinfo\n");
+  //   }
+  //   return AsyncInfo;
+  // }
+
+  // void freeAsyncInfo() {
+  //   if(AsyncInfo) {
+  //     printf("----------------AsyncInfo deleted\n");
+  //     delete AsyncInfo;
+  //     AsyncInfo = nullptr;
+  //   }
+  // }
+}
+
 /// creates host-to-target data mapping, stores it in the
 /// libomptarget.so internal structure (an entry in a stack of data maps)
 /// and passes the data to the device.
@@ -237,12 +277,14 @@ EXTERN void __tgt_target_data_update_mapper(ident_t *loc, int64_t device_id,
                          arg_names, "Updating OpenMP data");
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
+  AsyncInfoTy &AsyncInfo = *getAsyncInfo(Device);
+  AsyncInfo.synchronize();
   int rc = targetDataUpdate(loc, Device, arg_num, args_base, args, arg_sizes,
                             arg_types, arg_names, arg_mappers, AsyncInfo);
+  printf("Target data update end\n");
   if (rc == OFFLOAD_SUCCESS)
     rc = AsyncInfo.synchronize();
-  Device.freeAsyncInfo();
+  freeAsyncInfo();
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
 }
 
@@ -288,7 +330,6 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
     DP("Not offloading to device %" PRId64 "\n", device_id);
     return OMP_TGT_FAIL;
   }
-
   if (getInfoLevel() & OMP_INFOTYPE_KERNEL_ARGS)
     printKernelArguments(loc, device_id, arg_num, arg_sizes, arg_types,
                          arg_names, "Entering OpenMP kernel");
@@ -302,14 +343,14 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
 #endif
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = nowait?*(new AsyncInfoTy(Device)):*Device.getAsyncInfo();
+  AsyncInfoTy &AsyncInfo = *getAsyncInfo(Device);
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, 0, 0, false /*team*/,
                   AsyncInfo);
   if(nowait) {
     if (rc == OFFLOAD_SUCCESS)
       rc = AsyncInfo.synchronize();
-    delete &AsyncInfo;
+    freeAsyncInfo();
   }
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS && "__tgt_target_mapper unexpected failure!");
@@ -379,14 +420,14 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
 #endif
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = nowait?*(new AsyncInfoTy(Device)):*Device.getAsyncInfo();
+  AsyncInfoTy &AsyncInfo = *getAsyncInfo(Device);
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, team_num, thread_limit,
                   true /*team*/, AsyncInfo);
   if(nowait) {
     if (rc == OFFLOAD_SUCCESS)
       rc = AsyncInfo.synchronize();
-    delete &AsyncInfo;
+    freeAsyncInfo();
   }
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS &&
