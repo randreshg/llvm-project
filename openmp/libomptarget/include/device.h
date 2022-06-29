@@ -316,17 +316,17 @@ struct DeviceTy {
   //Asyncinfo
   AsyncInfoTy *getAsyncInfo() {
     if (!AsyncInfo) {
-      printf("----------------New Asyncinfo\n");
+      //printf("----------------New Asyncinfo\n");
       AsyncInfo = std::make_unique<AsyncInfoTy>(*this);
     }
     else{
-      printf("----------------Same Asyncinfo\n");
+      //printf("----------------Same Asyncinfo\n");
     }
     return AsyncInfo.get();
   }
 
   void freeAsyncInfo() {
-    printf("----------------Free Asyncinfo\n");
+    //printf("----------------Free Asyncinfo\n");
     AsyncInfo.reset();
     AsyncInfo = nullptr;
   }

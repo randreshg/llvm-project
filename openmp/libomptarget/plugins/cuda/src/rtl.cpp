@@ -560,9 +560,9 @@ public:
 
   ~DeviceRTLTy() {
     // Synchronize device
-    printf("----------------Synchronize device\n");
+    //printf("----------------Synchronize device\n");
     cuCtxSynchronize();
-    printf("----------------Synchronize device done\n");
+    //printf("----------------Synchronize device done\n");
     // We first destruct memory managers in case that its dependent data are
     // destroyed before it.
     for (auto &M : MemoryManagers)

@@ -46,8 +46,10 @@ int HostDataToTargetTy::addEventIfNecessary(
   return OFFLOAD_SUCCESS;
 }
 
+thread_local std::unique_ptr<AsyncInfoTy> DeviceTy::AsyncInfo = nullptr;
+
 DeviceTy::DeviceTy(RTLInfoTy *RTL)
-    : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), AsyncInfo(nullptr), IsInit(false), InitFlag(),
+    : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), IsInit(false), InitFlag(),
       HasPendingGlobals(false), HostDataToTargetMap(), PendingCtorsDtors(),
       ShadowPtrMap(), DataMapMtx(), PendingGlobalsMtx(), ShadowMtx() {}
 

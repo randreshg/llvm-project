@@ -244,7 +244,7 @@ EXTERN void __tgt_target_data_update_mapper(ident_t *loc, int64_t device_id,
   printf("Target data update end\n");
   if (rc == OFFLOAD_SUCCESS)
     rc = AsyncInfo.synchronize();
-  freeAsyncInfo();
+  Device.freeAsyncInfo();
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
 }
 
@@ -310,7 +310,7 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
   if(nowait) {
     if (rc == OFFLOAD_SUCCESS)
       rc = AsyncInfo.synchronize();
-    freeAsyncInfo();
+    Device.freeAsyncInfo();
   }
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS && "__tgt_target_mapper unexpected failure!");
@@ -387,7 +387,7 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
   if(nowait) {
     if (rc == OFFLOAD_SUCCESS)
       rc = AsyncInfo.synchronize();
-    freeAsyncInfo();
+    Device.freeAsyncInfo();
   }
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS &&

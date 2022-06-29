@@ -169,8 +169,8 @@ class AsyncInfoTy {
   DeviceTy &Device;
 
 public:
-  AsyncInfoTy(DeviceTy &Device) : Device(Device) { printf("----------------Asyncinfo Constructor\n"); }
-  ~AsyncInfoTy() { printf("----------------Asyncinfo Destructor\n"); } //synchronize();
+  AsyncInfoTy(DeviceTy &Device) : Device(Device) { /*printf("----------------Asyncinfo Constructor\n");*/ }
+  ~AsyncInfoTy() { /*printf("----------------Asyncinfo Destructor\n");*/ } //synchronize();
 
   /// Implicit conversion to the __tgt_async_info which is used in the
   /// plugin interface.
