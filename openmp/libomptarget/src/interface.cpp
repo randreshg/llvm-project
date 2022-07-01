@@ -303,15 +303,22 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
 #endif
 
   DeviceTy &Device = *PM->Devices[device_id];
-  AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
+  // AsyncInfoTy &AsyncInfo = *Device.getAsyncInfo();
+  AsyncInfoTy AsyncInfo(Device);
   int rc = target(loc, Device, host_ptr, arg_num, args_base, args, arg_sizes,
                   arg_types, arg_names, arg_mappers, 0, 0, false /*team*/,
                   AsyncInfo);
-  if(nowait) {
-    if (rc == OFFLOAD_SUCCESS)
+  // if(nowait) {
+  //   if (rc == OFFLOAD_SUCCESS)
+  //     rc = AsyncInfo.synchronize();
+  //   Device.freeAsyncInfo();
+  // }
+  if (rc == OFFLOAD_SUCCESS)
       rc = AsyncInfo.synchronize();
-    Device.freeAsyncInfo();
-  }
+  //Device.freeAsyncInfo();
+  // if (rc == OFFLOAD_SUCCESS)
+  //   rc = AsyncInfo.synchronize();
+  
   handleTargetOutcome(rc == OFFLOAD_SUCCESS, loc);
   assert(rc == OFFLOAD_SUCCESS && "__tgt_target_mapper unexpected failure!");
   return OMP_TGT_SUCCESS;

@@ -117,7 +117,6 @@ int memcpyDtoD(const void *SrcPtr, void *DstPtr, int64_t Size,
 int recordEvent(void *EventPtr, __tgt_async_info *AsyncInfo) {
   CUstream Stream = reinterpret_cast<CUstream>(AsyncInfo->Queue);
   CUevent Event = reinterpret_cast<CUevent>(EventPtr);
-
   CUresult Err = cuEventRecord(Event, Stream);
   if (Err != CUDA_SUCCESS) {
     DP("Error when recording event. stream = " DPxMOD ", event = " DPxMOD "\n",
@@ -478,7 +477,10 @@ public:
         return nullptr;
 
       AsyncInfo->Queue = S;
+      printf("----------------New stream assigned -  %d\n", DeviceId);
     }
+    else
+      printf("----------------Stream already assigned -  %d\n", DeviceId);
 
     return reinterpret_cast<CUstream>(AsyncInfo->Queue);
   }
@@ -1214,7 +1216,7 @@ public:
     // own tasks.
     StreamPool[DeviceId]->release(reinterpret_cast<CUstream>(AsyncInfo->Queue));
     AsyncInfo->Queue = nullptr;
-
+    printf("---------------- Stream cleared\n");
     if (Err != CUDA_SUCCESS) {
       DP("Error when synchronizing stream. stream = " DPxMOD
          ", async info ptr = " DPxMOD "\n",

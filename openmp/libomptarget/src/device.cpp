@@ -46,14 +46,22 @@ int HostDataToTargetTy::addEventIfNecessary(
   return OFFLOAD_SUCCESS;
 }
 
-thread_local std::unique_ptr<AsyncInfoTy> DeviceTy::AsyncInfo = nullptr;
+thread_local std::vector<std::unique_ptr<AsyncInfoTy>> AsyncInfoMng::AsyncInfo; 
+AsyncInfoMng DeviceTy::AsyncInfo;
+
+AsyncInfoTy *DeviceTy::getAsyncInfo() { return AsyncInfo.get(*this); };
+
+void DeviceTy::freeAsyncInfo() { AsyncInfo.free(*this); };
 
 DeviceTy::DeviceTy(RTLInfoTy *RTL)
     : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), IsInit(false), InitFlag(),
       HasPendingGlobals(false), HostDataToTargetMap(), PendingCtorsDtors(),
-      ShadowPtrMap(), DataMapMtx(), PendingGlobalsMtx(), ShadowMtx() {}
+      ShadowPtrMap(), DataMapMtx(), PendingGlobalsMtx(), ShadowMtx() {
+        printf("----------------New DeviceTy\n");
+      }
 
 DeviceTy::~DeviceTy() {
+  printf("----------------Free DeviceTy\n");
   if (DeviceID == -1 || !(getInfoLevel() & OMP_INFOTYPE_DUMP_TABLE))
     return;
   ident_t loc = {0, 0, 0, 0, ";libomptarget;libomptarget;0;0;;"};

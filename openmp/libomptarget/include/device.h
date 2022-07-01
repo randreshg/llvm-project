@@ -285,15 +285,17 @@ struct PendingCtorDtorListsTy {
 typedef std::map<__tgt_bin_desc *, PendingCtorDtorListsTy>
     PendingCtorsDtorsPerLibrary;
 
+struct AsyncInfoMng;
+
 struct DeviceTy {
   int32_t DeviceID;
   RTLInfoTy *RTL;
   int32_t RTLDeviceID;
-  static thread_local std::unique_ptr<AsyncInfoTy> AsyncInfo;
 
   bool IsInit;
   std::once_flag InitFlag;
   bool HasPendingGlobals;
+  static AsyncInfoMng AsyncInfo;
 
   HostDataToTargetListTy HostDataToTargetMap;
   PendingCtorsDtorsPerLibrary PendingCtorsDtors;
@@ -314,22 +316,8 @@ struct DeviceTy {
   ~DeviceTy();
 
   //Asyncinfo
-  AsyncInfoTy *getAsyncInfo() {
-    if (!AsyncInfo) {
-      //printf("----------------New Asyncinfo\n");
-      AsyncInfo = std::make_unique<AsyncInfoTy>(*this);
-    }
-    else{
-      //printf("----------------Same Asyncinfo\n");
-    }
-    return AsyncInfo.get();
-  }
-
-  void freeAsyncInfo() {
-    //printf("----------------Free Asyncinfo\n");
-    AsyncInfo.reset();
-    AsyncInfo = nullptr;
-  }
+  AsyncInfoTy *getAsyncInfo();
+  void freeAsyncInfo();
 
   // Return true if data can be copied to DstDevice directly
   bool isDataExchangable(const DeviceTy &DstDevice);
@@ -440,6 +428,36 @@ struct DeviceTy {
 private:
   // Call to RTL
   void init(); // To be called only via DeviceTy::initOnce()
+};
+
+struct AsyncInfoMng {
+  static thread_local std::vector<std::unique_ptr<AsyncInfoTy>> AsyncInfo;
+  //Get
+  AsyncInfoTy *get(DeviceTy &device) {
+    if (AsyncInfo.size() == 0) {
+      auto num_devices = omp_get_num_devices();
+      AsyncInfo.reserve(num_devices);
+      for(auto i = 0; i < num_devices; i++)
+        AsyncInfo.push_back(nullptr);
+      printf("NUM DEVICES: %d\n", (int)AsyncInfo.size()); 
+    }
+    //Get async info
+    if (!AsyncInfo[device.DeviceID]) {
+      AsyncInfo[device.DeviceID] = std::make_unique<AsyncInfoTy>(device);
+      printf("----------------New Asyncinfo: %d - %p\n", device.DeviceID, AsyncInfo[device.DeviceID].get());
+    }
+    else{
+      printf("----------------Same Asyncinfo: %d - %p\n", device.DeviceID, AsyncInfo[device.DeviceID].get());
+    }
+    return AsyncInfo[device.DeviceID].get();
+  }
+
+  //Free
+  void free(DeviceTy &device) {
+    printf("----------------Free Asyncinfo: %d\n", device.DeviceID);
+    AsyncInfo[device.DeviceID].reset();
+    AsyncInfo[device.DeviceID] = nullptr;
+  }
 };
 
 extern bool device_is_ready(int device_num);
