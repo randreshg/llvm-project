@@ -260,6 +260,7 @@ public:
     *TaskAsyncInfoPtr = nullptr;
   }
 
+  AsyncInfoTy *get() { return AsyncInfo; }
   operator AsyncInfoTy &() { return *AsyncInfo; }
 };
 

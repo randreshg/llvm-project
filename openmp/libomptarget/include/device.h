@@ -312,6 +312,8 @@ struct PendingCtorDtorListsTy {
 typedef std::map<__tgt_bin_desc *, PendingCtorDtorListsTy>
     PendingCtorsDtorsPerLibrary;
 
+class AsyncInfoMng;
+
 struct DeviceTy {
   int32_t DeviceID;
   RTLInfoTy *RTL;
@@ -339,6 +341,10 @@ struct DeviceTy {
   ShadowPtrListTy ShadowPtrMap;
 
   std::mutex PendingGlobalsMtx, ShadowMtx;
+
+  /// Manages AsyncInfo associated to the device and thread
+  /// depending on the value of the env variable LIBOMPTARGET_INTRA_THREAD_ASYNC
+  AsyncInfoMng AIM;
 
   DeviceTy(RTLInfoTy *RTL);
   // DeviceTy is not copyable

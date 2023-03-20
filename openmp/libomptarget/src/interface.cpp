@@ -100,7 +100,7 @@ targetDataMapper(ident_t *Loc, int64_t DeviceId, int32_t ArgNum,
 
   DeviceTy &Device = *PM->Devices[DeviceId];
   TargetAsyncInfoTy TargetAsyncInfo(Device);
-  AsyncInfoTy &AsyncInfo = TargetAsyncInfo;
+  AsyncInfoTy &AsyncInfo = Device.AIM.registerAI(TargetAsyncInfo.get());
 
   int Rc = OFFLOAD_SUCCESS;
   Rc = TargetDataFunction(Loc, Device, ArgNum, ArgsBase, Args, ArgSizes,
@@ -108,7 +108,7 @@ targetDataMapper(ident_t *Loc, int64_t DeviceId, int32_t ArgNum,
                           false /* FromMapper */);
 
   if (Rc == OFFLOAD_SUCCESS)
-    Rc = AsyncInfo.synchronize();
+    Rc = AsyncInfo.synchronize(true);
 
   handleTargetOutcome(Rc == OFFLOAD_SUCCESS, Loc);
 }
@@ -270,13 +270,15 @@ static inline int targetKernel(ident_t *Loc, int64_t DeviceId, int32_t NumTeams,
 
   DeviceTy &Device = *PM->Devices[DeviceId];
   TargetAsyncInfoTy TargetAsyncInfo(Device);
-  AsyncInfoTy &AsyncInfo = TargetAsyncInfo;
+  AsyncInfoTy &AsyncInfo = Device.AIM.registerAI(TargetAsyncInfo.get());
 
   int Rc = OFFLOAD_SUCCESS;
   Rc = target(Loc, Device, HostPtr, *KernelArgs, AsyncInfo);
 
-  if (Rc == OFFLOAD_SUCCESS)
+  if (Rc == OFFLOAD_SUCCESS) {
+    /// Synchronization is not forced here.
     Rc = AsyncInfo.synchronize();
+  }
 
   handleTargetOutcome(Rc == OFFLOAD_SUCCESS, Loc);
   assert(Rc == OFFLOAD_SUCCESS && "__tgt_target_kernel unexpected failure!");
@@ -342,7 +344,7 @@ EXTERN int __tgt_target_kernel_replay(ident_t *Loc, int64_t DeviceId,
                          TgtArgs, TgtOffsets, NumArgs, NumTeams, ThreadLimit,
                          LoopTripCount, AsyncInfo);
   if (Rc == OFFLOAD_SUCCESS)
-    Rc = AsyncInfo.synchronize();
+    Rc = AsyncInfo.synchronize(true);
   handleTargetOutcome(Rc == OFFLOAD_SUCCESS, Loc);
   assert(Rc == OFFLOAD_SUCCESS &&
          "__tgt_target_kernel_replay unexpected failure!");

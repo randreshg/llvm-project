@@ -20,27 +20,34 @@
 
 #include <cassert>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 using llvm::SmallVector;
 
-int AsyncInfoTy::synchronize() {
+bool AsyncFlag = false;
+
+int AsyncInfoTy::synchronize(bool ForceSync) {
   int Result = OFFLOAD_SUCCESS;
   if (!isQueueEmpty()) {
     switch (SyncType) {
     case SyncTy::BLOCKING:
-      // If we have a queue we need to synchronize it now.
-      Result = Device.synchronize(*this);
-      assert(AsyncInfo.Queue == nullptr &&
-             "The device plugin should have nulled the queue to indicate there "
-             "are no outstanding actions!");
+      if (!AsyncFlag || (AsyncFlag && hasDataTransfer) || ForceSync) {
+        // If we have a queue we need to synchronize it now.
+        DP("Device %d synchronization\n", Device.DeviceID);
+        Result = Device.synchronize(*this);
+        hasDataTransfer = false;
+        assert(
+            AsyncInfo.Queue == nullptr &&
+            "The device plugin should have nulled the queue to indicate there "
+            "are no outstanding actions!");
+      }
       break;
     case SyncTy::NON_BLOCKING:
       Result = Device.queryAsync(*this);
       break;
     }
   }
-
   // Run any pending post-processing function registered on this async object.
   if (Result == OFFLOAD_SUCCESS && isQueueEmpty())
     Result = runPostProcessing();
@@ -72,6 +79,32 @@ int32_t AsyncInfoTy::runPostProcessing() {
 }
 
 bool AsyncInfoTy::isQueueEmpty() const { return AsyncInfo.Queue == nullptr; }
+
+/// Async info manager
+AsyncInfoMng::AsyncInfoMng(DeviceTy &Device) : Device(Device) {}
+
+AsyncInfoMng::~AsyncInfoMng() {
+  for (const auto &It : AsyncInfoM)
+    delete (It.second);
+  AsyncInfoM.clear();
+}
+
+AsyncInfoTy &AsyncInfoMng::registerAI(AsyncInfoTy *AI) {
+  if (!AsyncFlag)
+    return *AI;
+
+  /// Get async info
+  std::lock_guard<std::mutex> MapLock(AsyncMtx);
+  llvm::DenseMap<std::thread::id, AsyncInfoTy *>::iterator it =
+      AsyncInfoM.find(std::this_thread::get_id());
+  if (it != AsyncInfoM.end())
+    return *(it->second);
+  /// Add new Async Info
+  AsyncInfoTy *AsyncInfo =
+      new AsyncInfoTy(Device, AsyncInfoTy::SyncTy::BLOCKING, false);
+  AsyncInfoM.insert(std::make_pair(std::this_thread::get_id(), AsyncInfo));
+  return *AsyncInfo;
+}
 
 /* All begin addresses for partially mapped structs must be aligned, up to 16,
  * in order to ensure proper alignment of members. E.g.
@@ -246,7 +279,7 @@ static int initLibrary(DeviceTy &Device) {
       }
     }
     // All constructors have been issued, wait for them now.
-    if (AsyncInfo.synchronize() != OFFLOAD_SUCCESS)
+    if (AsyncInfo.synchronize(true) != OFFLOAD_SUCCESS)
       return OFFLOAD_FAIL;
   }
   Device.HasPendingGlobals = false;
@@ -1020,7 +1053,7 @@ int targetDataEnd(ident_t *Loc, DeviceTy &Device, int32_t ArgNum,
     if (HasFrom && (HasAlways || IsLast) && !IsHostPtr) {
       DP("Moving %" PRId64 " bytes (tgt:" DPxMOD ") -> (hst:" DPxMOD ")\n",
          DataSize, DPxPTR(TgtPtrBegin), DPxPTR(HstPtrBegin));
-
+      AsyncInfo.hasDataTransfer = true;
       std::lock_guard<decltype(*TPR.Entry)> LG(*TPR.Entry);
       // Wait for any previous transfer if an event is present.
       if (void *Event = TPR.Entry->getEvent()) {

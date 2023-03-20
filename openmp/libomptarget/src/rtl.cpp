@@ -42,6 +42,7 @@ static const char *RTLNames[] = {
 PluginManager *PM;
 
 static char *ProfileTraceFile = nullptr;
+extern bool AsyncFlag;
 
 __attribute__((constructor(101))) void init() {
   DP("Init target library!\n");
@@ -61,6 +62,12 @@ __attribute__((constructor(101))) void init() {
   PM = new PluginManager(UseEventsForAtomicTransfers);
 
   ProfileTraceFile = getenv("LIBOMPTARGET_PROFILE");
+
+  /// Asynchronous execution flag
+  if (char *EnvStr = getenv("LIBOMPTARGET_INTRA_THREAD_ASYNC"))
+    AsyncFlag = std::stoi(EnvStr) ? true : false;
+  DP("Asynchronous execution %s\n", AsyncFlag ? "Enabled" : "Disabled");
+
   // TODO: add a configuration option for time granularity
   if (ProfileTraceFile)
     timeTraceProfilerInitialize(500 /* us */, "libomptarget");
@@ -539,7 +546,7 @@ void RTLsTy::unregisterLib(__tgt_bin_desc *Desc) {
           // Remove this library's entry from PendingCtorsDtors
           Device.PendingCtorsDtors.erase(Desc);
           // All constructors have been issued, wait for them now.
-          if (AsyncInfo.synchronize() != OFFLOAD_SUCCESS)
+          if (AsyncInfo.synchronize(true) != OFFLOAD_SUCCESS)
             DP("Failed synchronizing destructors kernels.\n");
         }
         Device.PendingGlobalsMtx.unlock();

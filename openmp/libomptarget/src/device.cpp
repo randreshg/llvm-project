@@ -52,7 +52,7 @@ int HostDataToTargetTy::addEventIfNecessary(DeviceTy &Device,
 DeviceTy::DeviceTy(RTLInfoTy *RTL)
     : DeviceID(-1), RTL(RTL), RTLDeviceID(-1), IsInit(false), InitFlag(),
       HasPendingGlobals(false), PendingCtorsDtors(), ShadowPtrMap(),
-      PendingGlobalsMtx(), ShadowMtx() {}
+      PendingGlobalsMtx(), ShadowMtx(), AIM(*this) {}
 
 DeviceTy::~DeviceTy() {
   if (DeviceID == -1 || !(getInfoLevel() & OMP_INFOTYPE_DUMP_TABLE))

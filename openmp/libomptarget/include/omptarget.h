@@ -17,12 +17,16 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <stddef.h>
 #include <stdint.h>
+#include <thread>
 #include <type_traits>
 
 #include <SourceInfo.h>
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/SmallVector.h"
 
 #define OFFLOAD_SUCCESS (0)
@@ -199,6 +203,8 @@ struct DeviceTy;
 class AsyncInfoTy {
 public:
   enum class SyncTy { BLOCKING, NON_BLOCKING };
+  /// Specify if the queue has data transfer operation
+  bool HasDataTransfer = false;
 
 private:
   /// Locations we used in (potentially) asynchronous calls which should live
@@ -218,15 +224,33 @@ public:
   /// Synchronization method to be used.
   SyncTy SyncType;
 
-  AsyncInfoTy(DeviceTy &Device, SyncTy SyncType = SyncTy::BLOCKING)
-      : Device(Device), SyncType(SyncType) {}
-  ~AsyncInfoTy() { synchronize(); }
+private:
+  /// Enables/Disable synchronization in destructor
+  const bool ShouldSyncWhenDestroyed;
+
+public:
+  AsyncInfoTy(DeviceTy &Device, SyncTy SyncType = SyncTy::BLOCKING,
+              bool ShouldSyncWhenDestroyed = true)
+      : Device(Device), SyncType(SyncType),
+        ShouldSyncWhenDestroyed(ShouldSyncWhenDestroyed) {}
+  ~AsyncInfoTy() {
+    if (ShouldSyncWhenDestroyed)
+      synchronize(true);
+  }
+  AsyncInfoTy *get() { return this; }
 
   /// Implicit conversion to the __tgt_async_info which is used in the
   /// plugin interface.
   operator __tgt_async_info *() { return &AsyncInfo; }
 
   /// Synchronize all pending actions.
+  ///
+  /// \note synchronization is performed when:
+  /// - LIBOMPTARGET_INTRA_THREAD_ASYNC is disabled
+  /// - LIBOMPTARGET_INTRA_THREAD_ASYNC is enabled and there is a memory
+  /// transfer (hasDataTransfer=true)
+  ///   in the target region
+  /// - Synchronization is forced (ForceSync = true)
   ///
   /// \note synchronization will be performance in a blocking or non-blocking
   /// manner, depending on the SyncType.
@@ -235,7 +259,7 @@ public:
   /// functions will be executed once and unregistered afterwards.
   ///
   /// \returns OFFLOAD_FAIL or OFFLOAD_SUCCESS appropriately.
-  int synchronize();
+  int synchronize(bool ForceSync = false);
 
   /// Return a void* reference with a lifetime that is at least as long as this
   /// AsyncInfoTy object. The location can be used as intermediate buffer.
@@ -276,6 +300,40 @@ private:
   ///
   /// \returns true if empty, false otherwise.
   bool isQueueEmpty() const;
+};
+
+/// Specialize DenseMapInfo for std::thread::id
+template <> struct llvm::DenseMapInfo<std::thread::id> {
+
+  static std::thread::id getEmptyKey() { return std::thread::id(); }
+
+  static std::thread::id getTombstoneKey() { return std::thread::id(); }
+
+  static unsigned getHashValue(const std::thread::id &Val) {
+    static std::hash<std::thread::id> hasher;
+    return hasher(Val);
+  }
+
+  static bool isEqual(std::thread::id LHS, std::thread::id RHS) {
+    return LHS == RHS;
+  }
+};
+
+/// This structs allows for automatic asynchronous execution of target regions.
+/// It associates an AsyncInfoTy object with a thread id to guarantee that
+/// target tasks of the same thread are launched on the same queue.
+class AsyncInfoMng {
+  llvm::DenseMap<std::thread::id, AsyncInfoTy *> AsyncInfoM;
+  DeviceTy &Device;
+  std::mutex AsyncMtx;
+
+public:
+  AsyncInfoMng(DeviceTy &Device);
+  ~AsyncInfoMng();
+
+  /// Replaces AI with the associated AsyncInfo object when
+  /// LIBOMPTARGET_INTRA_THREAD_ASYNC is enabled.
+  AsyncInfoTy &registerAI(AsyncInfoTy *AI);
 };
 
 /// This struct is a record of non-contiguous information
