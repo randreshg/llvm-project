@@ -5105,6 +5105,167 @@ private:
   RuntimeFunction RFKind;
 };
 
+
+// TDG Info
+struct AATDGInfo : public StateWrapper<BooleanState, AbstractAttribute> {
+  using Base = StateWrapper<BooleanState, AbstractAttribute>;
+
+  AATDGInfo(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
+
+  /// Statistics are tracked as part of manifest for now.
+  void trackStatistics() const override {}
+
+  static AATDGInfo &createForPosition(const IRPosition &IRP,
+                                            Attributor &A);
+
+  /// See AbstractAttribute::getName()
+  const std::string getName() const override { return "AATDGInfo"; }
+
+  /// See AbstractAttribute::getIdAddr()
+  const char *getIdAddr() const override { return &ID; }
+
+  /// This function should return true if the type of the \p AA is
+  /// AAFoldRuntimeCall
+  static bool classof(const AbstractAttribute *AA) {
+    return (AA->getIdAddr() == &ID);
+  }
+
+  static const char ID;
+};
+
+
+struct AATDGCallSite : AATDGInfo {
+  AATDGCallSite(const IRPosition &IRP, Attributor &A)
+      : AATDGInfo(IRP, A) {}
+
+  /// See AbstractAttribute::getAsStr()
+  const std::string getAsStr() const override {
+    if (!isValidState())
+      return "<invalid>";
+
+    std::string Str("simplified value: ");
+
+    // if (!SimplifiedValue)
+    //   return Str + std::string("none");
+
+    // if (!*SimplifiedValue)
+    //   return Str + std::string("nullptr");
+
+    // if (ConstantInt *CI = dyn_cast<ConstantInt>(*SimplifiedValue))
+    //   return Str + std::to_string(CI->getSExtValue());
+
+    return Str + std::string("unknown");
+  }
+
+  void initialize(Attributor &A) override {
+    // if (DisableOpenMPOptFolding)
+    //   indicatePessimisticFixpoint();
+    CallInst *TaskCallInst = dyn_cast<CallInst>(&getAnchorValue());
+    Function *TaskFunction = getAssociatedFunction();
+    printf("---------------------\n");
+    printf("Called: %s\n", TaskFunction->getName().str().c_str());
+    // Get dep num
+    const unsigned int DepNumArgNo = 3;
+    ConstantInt *DepNumArg = cast<ConstantInt>(TaskCallInst->getArgOperand(DepNumArgNo));
+    int DepNum = DepNumArg->getSExtValue();
+    printf("DepNum: %d\n", DepNum);
+    // Get dep list
+    const unsigned int DepListArgNo = 4;
+    auto *DepListArg = TaskCallInst->getArgOperand(DepListArgNo);
+    auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));  //No need to do this
+    // auto *DepListType = DepList->getAllocatedType();
+    // const uint64_t NumValues = DepListType->getArrayNumElements();
+    //
+
+    // auto CheckAccess = [&](const AAPointerInfo::Access &Acc, bool IsExact) {
+    //   // Get store instruction
+    //   auto *SI = dyn_cast<StoreInst>(Acc.getRemoteInst());
+    //   Value *V = SI->getValueOperand();
+    //   printf("OK\n");
+    //   return true;
+    // };
+    // bool HasBeenWrittenTo = false;
+    // AA::RangeTy Range;
+    // auto &PI = A.getAAFor<AAPointerInfo>(
+    //   /* QueryingAA */ *this,
+    //   IRPosition::value(*DepListArg), DepClassTy::NONE
+    // );
+    // if (!PI.forallInterferingAccesses(A, *this, DepListAlloca,
+    //                                   /* FindInterferingWrites */ true,
+    //                                   /* FindInterferingReads */ false,
+    //                                   CheckAccess, HasBeenWrittenTo, Range)) {
+    //   printf("Not working\n");
+    // }
+
+    //   for(uint64_t i=0; i < NumValues; i++) {
+    //     // // Access the `i` element of the array
+    //     // auto *Index = ConstantInt::get(Type::getInt64Ty(Ctx), i);
+    //     // auto *DepPtr = GetElementPtrInst::CreateInBounds(DepListType, DepList, {Index}, "", TaskCallInst);
+    //     // // Access the `len` field of the struct
+    //     // auto *Index0 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+    //     // auto *Index1 = ConstantInt::get(Type::getInt32Ty(Ctx), 1);
+    //     // auto *LenPtr = GetElementPtrInst::CreateInBounds(DepListType, DepPtr, {Index0, Index1}, "", TaskCallInst);
+    //     // auto *Len = new LoadInst(Type::getInt64Ty(Ctx), LenPtr, "", TaskCallInst);
+    //     // auto *Lens = cast<ConstantInt>(getUnderlyingObject(Len->getOperand(0)));
+        
+    //   }
+    //   return false;
+    // };
+    
+    // auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
+    // const auto &It = OMPInfoCache.RuntimeFunctionIDMap.find(Callee);
+    // assert(It != OMPInfoCache.RuntimeFunctionIDMap.end() &&
+    //        "Expected a known OpenMP runtime function");
+
+    // RFKind = It->getSecond();
+
+    // CallBase &CB = cast<CallBase>(getAssociatedValue());
+    // A.registerSimplificationCallback(
+    //     IRPosition::callsite_returned(CB),
+    //     [&](const IRPosition &IRP, const AbstractAttribute *AA,
+    //         bool &UsedAssumedInformation) -> std::optional<Value *> {
+    //       assert((isValidState() ||
+    //               (SimplifiedValue && *SimplifiedValue == nullptr)) &&
+    //              "Unexpected invalid state!");
+
+    //       if (!isAtFixpoint()) {
+    //         UsedAssumedInformation = true;
+    //         if (AA)
+    //           A.recordDependence(*this, *AA, DepClassTy::OPTIONAL);
+    //       }
+    //       return SimplifiedValue;
+    //     });
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    // switch (RFKind) {
+    // // ------------------------------------------
+    // default:
+    //   llvm_unreachable("Unhandled OpenMP runtime function!");
+    // }
+
+    return Changed;
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    // ------------------------------------------
+    return Changed;
+  }
+
+  ChangeStatus indicatePessimisticFixpoint() override {
+    //SimplifiedValue = nullptr;
+    return AATDGInfo::indicatePessimisticFixpoint();
+  }
+
+private:
+
+
+  /// The runtime function kind of the callee of the associated call site.
+  RuntimeFunction RFKind;
+};
+
 } // namespace
 
 /// Register folding callsite
@@ -5146,6 +5307,21 @@ void OpenMPOpt::registerAAs(bool IsModulePass) {
     registerFoldRuntimeCall(OMPRTL___kmpc_parallel_level);
     registerFoldRuntimeCall(OMPRTL___kmpc_get_hardware_num_threads_in_block);
     registerFoldRuntimeCall(OMPRTL___kmpc_get_hardware_num_blocks);
+    // -----------------------------------------------------------------------
+    OMPInformationCache::RuntimeFunctionInfo &RFI = 
+        OMPInfoCache.RFIs[OMPRTL___kmpc_omp_task_with_deps];
+    // For each use of the runtime function, get the task info.
+    RFI.foreachUse(SCC, [&](Use &U, Function &F) {
+      CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &RFI);
+      if (!CI)
+        return false;
+      A.getOrCreateAAFor<AATDGInfo>(
+          IRPosition::callsite_returned(*CI), /* QueryingAA */ nullptr,
+          DepClassTy::NONE, /* ForceUpdate */ false,
+          /* UpdateAfterInit */ false);
+      return false;
+    });
+    // -----------------------------------------------------------------------
   }
 
   // Create CallSite AA for all Getters.
@@ -5230,6 +5406,7 @@ const char AAKernelInfo::ID = 0;
 const char AAExecutionDomain::ID = 0;
 const char AAHeapToShared::ID = 0;
 const char AAFoldRuntimeCall::ID = 0;
+const char AATDGInfo::ID = 0;
 
 AAICVTracker &AAICVTracker::createForPosition(const IRPosition &IRP,
                                               Attributor &A) {
@@ -5339,6 +5516,25 @@ AAFoldRuntimeCall &AAFoldRuntimeCall::createForPosition(const IRPosition &IRP,
   }
 
   return *AA;
+}
+
+AATDGInfo &AATDGInfo::createForPosition(const IRPosition &IRP,
+                                        Attributor &A) {
+  AATDGInfo *AA = nullptr;
+  switch (IRP.getPositionKind()) {
+    case IRPosition::IRP_INVALID:
+    case IRPosition::IRP_FLOAT:
+    case IRPosition::IRP_ARGUMENT:
+    case IRPosition::IRP_RETURNED:
+    case IRPosition::IRP_FUNCTION:
+    case IRPosition::IRP_CALL_SITE:
+    case IRPosition::IRP_CALL_SITE_ARGUMENT:
+      llvm_unreachable("TDGInfo can only be created for call site position!");
+    case IRPosition::IRP_CALL_SITE_RETURNED:
+      AA = new (A.Allocator) AATDGCallSite(IRP, A);
+      break;
+  }
+    return *AA;
 }
 
 PreservedAnalyses OpenMPOptPass::run(Module &M, ModuleAnalysisManager &AM) {

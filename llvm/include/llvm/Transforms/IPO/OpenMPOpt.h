@@ -32,6 +32,27 @@ bool isOpenMPDevice(Module &M);
 /// Get OpenMP device kernels in \p M.
 KernelSet getDeviceKernels(Module &M);
 
+/// Tasks structures and typedefs extracted from kmp.h
+typedef int kmp_int32;
+typedef int64_t kmp_int64;
+typedef intptr_t kmp_intptr_t;
+typedef unsigned char kmp_uint8;
+
+typedef struct kmp_depend_info {
+  kmp_intptr_t base_addr;
+  size_t len;
+  union {
+    kmp_uint8 flag; // flag as an unsigned char
+    struct { // flag as a set of 8 bits
+      unsigned in : 1;
+      unsigned out : 1;
+      unsigned mtx : 1;
+      unsigned set : 1;
+      unsigned unused : 3;
+      unsigned all : 1;
+    } flags;
+  };
+} kmp_depend_info_t;
 } // namespace omp
 
 /// OpenMP optimizations pass.
