@@ -28,6 +28,7 @@
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Analysis/CallGraphSCCPass.h"
 #include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
@@ -52,6 +53,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CallGraphUpdater.h"
 
+#include <iostream>
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -1923,6 +1925,8 @@ private:
   }
 
   void registerFoldRuntimeCall(RuntimeFunction RF);
+
+  void registerTDGAA();
 
   /// Populate the Attributor with abstract attribute opportunities in the
   /// functions.
@@ -5143,114 +5147,170 @@ struct AATDGCallSite : AATDGInfo {
     if (!isValidState())
       return "<invalid>";
 
-    std::string Str("simplified value: ");
-
-    // if (!SimplifiedValue)
-    //   return Str + std::string("none");
-
-    // if (!*SimplifiedValue)
-    //   return Str + std::string("nullptr");
-
-    // if (ConstantInt *CI = dyn_cast<ConstantInt>(*SimplifiedValue))
-    //   return Str + std::to_string(CI->getSExtValue());
+    std::string Str("AATDGInfo: ");
 
     return Str + std::string("unknown");
   }
 
   void initialize(Attributor &A) override {
-    // if (DisableOpenMPOptFolding)
-    //   indicatePessimisticFixpoint();
-    CallInst *TaskCallInst = dyn_cast<CallInst>(&getAnchorValue());
+    CallBase *TaskCallBase = dyn_cast<CallBase>(&getAnchorValue());
     Function *TaskFunction = getAssociatedFunction();
-    printf("---------------------\n");
-    printf("Called: %s\n", TaskFunction->getName().str().c_str());
+    if (!TaskCallBase || !TaskFunction) {
+      indicatePessimisticFixpoint();
+      return;
+    }
+    LLVM_DEBUG(dbgs()<<"\n------------------------------------------\n");
+    // printf("Called: %s\n", TaskFunction->getName().str().c_str());
+    LLVM_DEBUG(dbgs() << "[TDGInfo] Called: " << TaskFunction->getName() << "\n");
     // Get dep num
-    const unsigned int DepNumArgNo = 3;
-    ConstantInt *DepNumArg = cast<ConstantInt>(TaskCallInst->getArgOperand(DepNumArgNo));
+    ConstantInt *DepNumArg = cast<ConstantInt>(TaskCallBase->getArgOperand(DepNumArgNo));
     int DepNum = DepNumArg->getSExtValue();
-    printf("DepNum: %d\n", DepNum);
-    // Get dep list
-    const unsigned int DepListArgNo = 4;
-    auto *DepListArg = TaskCallInst->getArgOperand(DepListArgNo);
-    auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));  //No need to do this
-    // auto *DepListType = DepList->getAllocatedType();
-    // const uint64_t NumValues = DepListType->getArrayNumElements();
-    //
-
-    // auto CheckAccess = [&](const AAPointerInfo::Access &Acc, bool IsExact) {
-    //   // Get store instruction
-    //   auto *SI = dyn_cast<StoreInst>(Acc.getRemoteInst());
-    //   Value *V = SI->getValueOperand();
-    //   printf("OK\n");
-    //   return true;
-    // };
-    // bool HasBeenWrittenTo = false;
-    // AA::RangeTy Range;
-    // auto &PI = A.getAAFor<AAPointerInfo>(
-    //   /* QueryingAA */ *this,
-    //   IRPosition::value(*DepListArg), DepClassTy::NONE
-    // );
-    // if (!PI.forallInterferingAccesses(A, *this, DepListAlloca,
-    //                                   /* FindInterferingWrites */ true,
-    //                                   /* FindInterferingReads */ false,
-    //                                   CheckAccess, HasBeenWrittenTo, Range)) {
-    //   printf("Not working\n");
-    // }
-
-    //   for(uint64_t i=0; i < NumValues; i++) {
-    //     // // Access the `i` element of the array
-    //     // auto *Index = ConstantInt::get(Type::getInt64Ty(Ctx), i);
-    //     // auto *DepPtr = GetElementPtrInst::CreateInBounds(DepListType, DepList, {Index}, "", TaskCallInst);
-    //     // // Access the `len` field of the struct
-    //     // auto *Index0 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
-    //     // auto *Index1 = ConstantInt::get(Type::getInt32Ty(Ctx), 1);
-    //     // auto *LenPtr = GetElementPtrInst::CreateInBounds(DepListType, DepPtr, {Index0, Index1}, "", TaskCallInst);
-    //     // auto *Len = new LoadInst(Type::getInt64Ty(Ctx), LenPtr, "", TaskCallInst);
-    //     // auto *Lens = cast<ConstantInt>(getUnderlyingObject(Len->getOperand(0)));
-        
-    //   }
-    //   return false;
-    // };
+    LLVM_DEBUG(dbgs() << "[TDGInfo] DepNum: " << DepNum << "\n");
+  
+    LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] Analysis started\n");
+    // For purposes of this analysis, we will assume the DepListArg is not captured
+    TaskCallBase->addParamAttr(DepListArgNo, Attribute::NoCapture);
+    auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
+    auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
     
-    // auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
-    // const auto &It = OMPInfoCache.RuntimeFunctionIDMap.find(Callee);
-    // assert(It != OMPInfoCache.RuntimeFunctionIDMap.end() &&
-    //        "Expected a known OpenMP runtime function");
-
-    // RFKind = It->getSecond();
-
-    // CallBase &CB = cast<CallBase>(getAssociatedValue());
-    // A.registerSimplificationCallback(
-    //     IRPosition::callsite_returned(CB),
-    //     [&](const IRPosition &IRP, const AbstractAttribute *AA,
-    //         bool &UsedAssumedInformation) -> std::optional<Value *> {
-    //       assert((isValidState() ||
-    //               (SimplifiedValue && *SimplifiedValue == nullptr)) &&
-    //              "Unexpected invalid state!");
-
-    //       if (!isAtFixpoint()) {
-    //         UsedAssumedInformation = true;
-    //         if (AA)
-    //           A.recordDependence(*this, *AA, DepClassTy::OPTIONAL);
-    //       }
-    //       return SimplifiedValue;
-    //     });
+    // Get the pointer info
+    auto &PI = A.getAAFor<AAPointerInfo>(
+      *this, 
+      //IRPosition::callsite_argument(*TaskCallBase, DepListArgNo),
+      IRPosition::value(*DepListAlloca),
+      DepClassTy::NONE);
+    /// Check state
+    if(!PI.getState().isValidState()) {
+      LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] PI is invalid\n");
+      indicatePessimisticFixpoint();
+    }
+    LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] forallInterferingAccesses finished" << "\n");
+    LLVM_DEBUG(dbgs()<<"\n------------------------------------------\n");
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    // switch (RFKind) {
-    // // ------------------------------------------
-    // default:
-    //   llvm_unreachable("Unhandled OpenMP runtime function!");
-    // }
-
     return Changed;
   }
 
   ChangeStatus manifest(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
     // ------------------------------------------
+    LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] Manifest\n");
+    CallBase *TaskCallBase = dyn_cast<CallBase>(&getAnchorValue());
+    auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
+    auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
+    //  Retrieve PI
+    auto *PI = A.lookupAAFor<AAPointerInfo>(
+      IRPosition::value(*DepListAlloca),
+      this, DepClassTy::NONE);
+    if(!PI) {
+      LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] PI is invalid\n");
+      return Changed;
+    }
+
+    auto simpleCB = [&](const AA::RangeTy& Range, const SmallSet<unsigned, 4>& AccIndex) {
+      LLVM_DEBUG(dbgs() << "[" << Range.Offset << "-" << Range.Offset + Range.Size
+        << "] : " << AccIndex.size() << "\n");
+      for (auto AI : AccIndex) {
+        auto &Acc = PI->getAccess(AI);
+        LLVM_DEBUG(dbgs() << "     - " << Acc.getKind() << " - " << *Acc.getLocalInst() << "\n");
+        if (Acc.getLocalInst() != Acc.getRemoteInst())
+          LLVM_DEBUG(dbgs() << "     -->                         " << *Acc.getRemoteInst()
+            << "\n");
+        if (!Acc.isWrittenValueYetUndetermined()) {
+          if (isa_and_nonnull<Function>(Acc.getWrittenValue()))
+            LLVM_DEBUG(dbgs() << "       - c: func " << Acc.getWrittenValue()->getName()
+              << "\n");
+          else if (Acc.getWrittenValue())
+            LLVM_DEBUG(dbgs() << "       - c: " << *Acc.getWrittenValue() << "\n");
+          else
+            LLVM_DEBUG(dbgs() << "       - c: <unknown>\n");
+        }
+      }
+      return true;
+    };
+
+    if(!PI->forallOffsetBins(simpleCB)) {
+      printf("Not working\n");
+    }
+  
+    // Remove NoCapture attribute... Do I have to report this change after manifest?
+    TaskCallBase->removeParamAttr(DepListArgNo, Attribute::NoCapture);
+
+    // auto CheckAccessCB = [&](const AAPointerInfo::Access &Acc, bool IsExact) {
+    //   // Store instruction
+    //   if(auto *SI = dyn_cast<StoreInst>(Acc.getRemoteInst())) {
+    //     // Print store value
+    //     Value *V = SI->getValueOperand();
+    //     if (!V)
+    //       return false;
+    //     printf("Store value: %s\n", V->getName().str().c_str());
+    //     return true;
+    //   }
+    //   else if (auto *LI = dyn_cast<LoadInst>(Acc.getRemoteInst())) {
+    //     if (!Acc.isWrittenValueUnknown()) {
+    //       Value *V = Acc.getWrittenValue();
+    //       if (!V)
+    //         return false;
+    //       // Print load value
+    //       printf("Load value: %s\n", V->getName().str().c_str());
+    //       return true;
+    //     }
+    //   }
+    //   else {
+    //     printf("NOT A STORE OR LOAD\n");
+    //     // assert(isa<StoreInst>(I) && "Expected load or store instruction only!");
+    //     // auto *LI = dyn_cast<LoadInst>(Acc.getRemoteInst());
+    //     // if (!LI && OnlyExact) {
+    //     //   LLVM_DEBUG(dbgs() << "Underlying object read through a non-load "
+    //     //                        "instruction not supported yet: "
+    //     //                     << *Acc.getRemoteInst() << "\n";);
+    //     //   return false;
+    //     // }
+    //   }
+    //   // printf("Access: %s\n", Acc.getAccessInstruction()->getName().str().c_str());
+    //   LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] CheckAccess\n");
+    //   return false;
+    // };
+
+    // -------------------------------------------------------
+    // auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
+    // // For most of the cases, this is already an alloca instruction, for other
+    // // cases, it is GEPInst (at least when OPT=0)
+    // // auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
+    // Instruction *I = cast<Instruction>(DepListArg);
+    // LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] forallInterferingAccesses started" << "\n");
+    // if (!PI.forallInterferingAccesses(A, *this, *I,
+    //                                   /* FindInterferingWrites */ true,
+    //                                   /* FindInterferingReads */ true,
+    //                                   CheckAccessCB, HasBeenWrittenTo, Range)) {
+    //   LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] NOT WORKING\n");
+    //   LLVM_DEBUG(
+    //     dbgs()
+    //     << "Failed to verify all interfering accesses for the instruction\n");
+    //   return;
+    // }
+    // if(!PI.forallOffsetBins(simpleCB)) {
+    //   LLVM_DEBUG(
+    //     dbgs()
+    //     << "Failed to verify all Offset bins for the instruction\n");
+    // }
+
+
+    // -------------------------------------------------------
+    // printf("----------\n[TDGInfo][MemSSA] Analysis started\n");
+    // // Get caller of taskfunction
+    // Function *CallerFunction = (Function *)TaskCallBase->getCaller();
+    // printf("[TDGInfo][MemSSA] Caller: %s\n", CallerFunction->getName().str().c_str());
+    // // Get AnalysisGetter
+    // auto &AG = A.getInfoCache().getAnalysisGetter();
+    // auto result= A.getAnalysisResultForFunction<MemorySSAAnalysis>(*CallerFunction);
+    // auto result2= AG.getAnalys<MemorySSAAnalysis>(*TaskFunction);
+    // auto analysis = AG.getAnalysis<MemorySSAAnalysis>(CallerFunction);
+    // MemorySSA &MSSA = .getMSSA();
+    // // printf("[TDGInfo][MemSSA] Analysis finished\n----------\n");
+    
     return Changed;
   }
 
@@ -5260,10 +5320,11 @@ struct AATDGCallSite : AATDGInfo {
   }
 
 private:
-
-
   /// The runtime function kind of the callee of the associated call site.
   RuntimeFunction RFKind;
+  /// Task arguments
+  const unsigned int DepNumArgNo = 3;
+  const unsigned int DepListArgNo = 4;
 };
 
 } // namespace
@@ -5276,6 +5337,23 @@ void OpenMPOpt::registerFoldRuntimeCall(RuntimeFunction RF) {
     if (!CI)
       return false;
     A.getOrCreateAAFor<AAFoldRuntimeCall>(
+        IRPosition::callsite_returned(*CI), /* QueryingAA */ nullptr,
+        DepClassTy::NONE, /* ForceUpdate */ false,
+        /* UpdateAfterInit */ false);
+    return false;
+  });
+}
+
+void OpenMPOpt::registerTDGAA() {
+  LLVM_DEBUG(dbgs() << "[OpenMPOpt] [TDGInfo] Registering AATDGInfo\n");
+  OMPInformationCache::RuntimeFunctionInfo &RFI = 
+      OMPInfoCache.RFIs[OMPRTL___kmpc_omp_task_with_deps];
+  // For each use of the runtime function, get the task info.
+  RFI.foreachUse(SCC, [&](Use &U, Function &F) {
+    CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &RFI);
+    if (!CI)
+      return false;
+    A.getOrCreateAAFor<AATDGInfo>(
         IRPosition::callsite_returned(*CI), /* QueryingAA */ nullptr,
         DepClassTy::NONE, /* ForceUpdate */ false,
         /* UpdateAfterInit */ false);
@@ -5307,21 +5385,8 @@ void OpenMPOpt::registerAAs(bool IsModulePass) {
     registerFoldRuntimeCall(OMPRTL___kmpc_parallel_level);
     registerFoldRuntimeCall(OMPRTL___kmpc_get_hardware_num_threads_in_block);
     registerFoldRuntimeCall(OMPRTL___kmpc_get_hardware_num_blocks);
-    // -----------------------------------------------------------------------
-    OMPInformationCache::RuntimeFunctionInfo &RFI = 
-        OMPInfoCache.RFIs[OMPRTL___kmpc_omp_task_with_deps];
-    // For each use of the runtime function, get the task info.
-    RFI.foreachUse(SCC, [&](Use &U, Function &F) {
-      CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &RFI);
-      if (!CI)
-        return false;
-      A.getOrCreateAAFor<AATDGInfo>(
-          IRPosition::callsite_returned(*CI), /* QueryingAA */ nullptr,
-          DepClassTy::NONE, /* ForceUpdate */ false,
-          /* UpdateAfterInit */ false);
-      return false;
-    });
-    // -----------------------------------------------------------------------
+    //TDG AA
+    registerTDGAA();
   }
 
   // Create CallSite AA for all Getters.
@@ -5369,6 +5434,8 @@ void OpenMPOpt::registerAAs(bool IsModulePass) {
     }
     registerAAsForFunction(A, *F);
   }
+
+  
 }
 
 void OpenMPOpt::registerAAsForFunction(Attributor &A, const Function &F) {

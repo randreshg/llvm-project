@@ -1038,6 +1038,22 @@ struct AAPointerInfoImpl
     return AAPointerInfo::manifest(A);
   }
 
+  const AAPointerInfo::Access &getAccess(unsigned Index) const override {
+    return State::getAccess(Index);
+  }
+
+  bool forallOffsetBins(
+    function_ref<bool(const AA::RangeTy&, const SmallSet<unsigned, 4>&)> CB)
+    const override {
+    for (auto &It : OffsetBins) {
+      const AA::RangeTy& key = It.first;
+      const SmallSet<unsigned, 4>& value = It.second;
+      if (!CB(key, value))
+        return false;
+    }
+    return true;
+  }
+
   bool forallInterferingAccesses(
       AA::RangeTy Range,
       function_ref<bool(const AAPointerInfo::Access &, bool)> CB)
@@ -1051,6 +1067,11 @@ struct AAPointerInfoImpl
       function_ref<bool(const Access &, bool)> UserCB, bool &HasBeenWrittenTo,
       AA::RangeTy &Range) const override {
     HasBeenWrittenTo = false;
+
+    LLVM_DEBUG(dbgs() << "[AAPointerInfo] forallInterferingAccesses\n");
+    // LLVM_DEBUG("[AAPointerInfo] FindInterferingWrites: " <<
+    // (int)FindInterferingWrites << " FindInterferingReads: " <<
+    // (int)FindInterferingReads << "\n");
 
     SmallPtrSet<const Access *, 8> DominatingWrites;
     SmallVector<std::pair<const Access *, bool>, 8> InterferingAccesses;
@@ -1840,7 +1861,7 @@ ChangeStatus AAPointerInfoFloating::updateImpl(Attributor &A) {
   }
 
   LLVM_DEBUG({
-    dbgs() << "Accesses by bin after update:\n";
+    dbgs() << "Accesses by bin after update in AAPointerInfoFloating::updateImpl:\n";
     dumpState(dbgs());
   });
 
@@ -1886,6 +1907,7 @@ struct AAPointerInfoCallSiteArgument final : AAPointerInfoFloating {
   /// See AbstractAttribute::updateImpl(...).
   ChangeStatus updateImpl(Attributor &A) override {
     using namespace AA::PointerInfo;
+    LLVM_DEBUG(dbgs() << "[AAPointerInfo] AAPointerInfoCallSiteArgument updateImpl\n");
     // We handle memory intrinsics explicitly, at least the first (=
     // destination) and second (=source) arguments as we know how they are
     // accessed.
