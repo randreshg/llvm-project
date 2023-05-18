@@ -5160,11 +5160,13 @@ struct AATDGCallSite : AATDGInfo {
       return;
     }
     LLVM_DEBUG(dbgs()<<"\n------------------------------------------\n");
-    // printf("Called: %s\n", TaskFunction->getName().str().c_str());
+    /// Allocate task
+    TI = new TaskInfo();
     LLVM_DEBUG(dbgs() << "[TDGInfo] Called: " << TaskFunction->getName() << "\n");
     // Get dep num
     ConstantInt *DepNumArg = cast<ConstantInt>(TaskCallBase->getArgOperand(DepNumArgNo));
-    int DepNum = DepNumArg->getSExtValue();
+    int64_t DepNum = DepNumArg->getSExtValue();
+    TI->TaskDepInfo.resize(DepNum);
     LLVM_DEBUG(dbgs() << "[TDGInfo] DepNum: " << DepNum << "\n");
   
     LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] Analysis started\n");
@@ -5195,7 +5197,7 @@ struct AATDGCallSite : AATDGInfo {
 
   ChangeStatus manifest(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    // ------------------------------------------
+
     LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] Manifest\n");
     CallBase *TaskCallBase = dyn_cast<CallBase>(&getAnchorValue());
     auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
@@ -5212,21 +5214,63 @@ struct AATDGCallSite : AATDGInfo {
     auto simpleCB = [&](const AA::RangeTy& Range, const SmallSet<unsigned, 4>& AccIndex) {
       LLVM_DEBUG(dbgs() << "[" << Range.Offset << "-" << Range.Offset + Range.Size
         << "] : " << AccIndex.size() << "\n");
+      int64_t DepItr = Range.Offset/StructSize;
+      int64_t ElemItr = (Range.Offset%StructSize)/StructAlign;
+      LLVM_DEBUG(dbgs() << "Size: "<< TI->TaskDepInfo.size()<<" [" << DepItr << "-" << ElemItr << "]\n");
+
       for (auto AI : AccIndex) {
         auto &Acc = PI->getAccess(AI);
         LLVM_DEBUG(dbgs() << "     - " << Acc.getKind() << " - " << *Acc.getLocalInst() << "\n");
-        if (Acc.getLocalInst() != Acc.getRemoteInst())
-          LLVM_DEBUG(dbgs() << "     -->                         " << *Acc.getRemoteInst()
-            << "\n");
-        if (!Acc.isWrittenValueYetUndetermined()) {
-          if (isa_and_nonnull<Function>(Acc.getWrittenValue()))
+        /// Store instruction
+        if(Acc.getKind() == AAPointerInfo::AccessKind::AK_MUST_WRITE) {
+          // LLVM_DEBUG(dbgs() << "       - Store instruction\n");
+          if (Acc.getLocalInst() != Acc.getRemoteInst())
+            LLVM_DEBUG(dbgs() << "     -->                         " << *Acc.getRemoteInst()
+              << "\n");
+
+          if (auto *Value = Acc.getWrittenValue()) {
+            LLVM_DEBUG(dbgs() << "       - c: " << *Acc.getWrittenValue() << "\n");
+            auto &Dep = TI->TaskDepInfo[DepItr];
+            if(auto *PtII = dyn_cast<PtrToIntInst>(Value)) {
+              if (ElemItr == 0) {
+                auto *BasePtr = PtII->getPointerOperand();
+                Dep.BasePtr = getUnderlyingObject(BasePtr);
+              }
+              else {
+                LLVM_DEBUG(dbgs() << "PtrToIntInst not supported\n");
+                return false;
+              }
+            }
+            else if (auto *CI = dyn_cast<ConstantInt>(Value)) {
+              auto ConstantVal = CI->getSExtValue();
+              // LLVM_DEBUG(dbgs() << "       - Value:"<<ConstantVal<<"\n");
+              if (ElemItr == 1)
+                Dep.len = ConstantVal;
+              else if (ElemItr == 2)
+                Dep.flag = (uint8_t)ConstantVal;
+              else {
+                LLVM_DEBUG(dbgs() << "Store not supported\n");
+                return false;
+              }
+            }
+            else {
+              LLVM_DEBUG(dbgs() << "Store not supported\n");
+              return false;
+            }
+          }
+          else if (isa_and_nonnull<Function>(Acc.getWrittenValue()))
             LLVM_DEBUG(dbgs() << "       - c: func " << Acc.getWrittenValue()->getName()
               << "\n");
-          else if (Acc.getWrittenValue())
-            LLVM_DEBUG(dbgs() << "       - c: " << *Acc.getWrittenValue() << "\n");
           else
             LLVM_DEBUG(dbgs() << "       - c: <unknown>\n");
         }
+        else if(Acc.isWrittenValueYetUndetermined()) {
+          // Indicate pessimistic point?
+          // Try to get the value? Call simpleCB again?
+          LLVM_DEBUG(dbgs() << "       - Value undetermined\n");
+          return false;
+        }
+        
       }
       return true;
     };
@@ -5321,10 +5365,16 @@ struct AATDGCallSite : AATDGInfo {
 
 private:
   /// The runtime function kind of the callee of the associated call site.
-  RuntimeFunction RFKind;
+  // RuntimeFunction RFKind;
+  TaskInfo *TI;
+  ///  Information about the TaskDependInfo struct
+  const int64_t StructSize = 24;
+  const int64_t StructAlign = 8;
+  const int64_t StructElem = StructSize/StructAlign;
   /// Task arguments
   const unsigned int DepNumArgNo = 3;
   const unsigned int DepListArgNo = 4;
+  /// Aux variables
 };
 
 } // namespace

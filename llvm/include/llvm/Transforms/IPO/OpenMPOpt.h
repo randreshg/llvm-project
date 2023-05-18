@@ -36,13 +36,13 @@ KernelSet getDeviceKernels(Module &M);
 typedef int kmp_int32;
 typedef int64_t kmp_int64;
 typedef intptr_t kmp_intptr_t;
-typedef unsigned char kmp_uint8;
+typedef unsigned char uint8;
 
 typedef struct kmp_depend_info {
-  kmp_intptr_t base_addr;
+  Value *base_addr;
   size_t len;
   union {
-    kmp_uint8 flag; // flag as an unsigned char
+    uint8 flag; // flag as an unsigned char
     struct { // flag as a set of 8 bits
       unsigned in : 1;
       unsigned out : 1;
@@ -52,7 +52,16 @@ typedef struct kmp_depend_info {
       unsigned all : 1;
     } flags;
   };
-} kmp_depend_info_t;
+} TaskDependInfo;
+
+struct TaskInfo {
+  int id;                                     // Task id
+  SmallVector<uint64_t, 2> successors;        // Ids of successors
+  SmallVector<uint64_t, 2> predecessors;      // Ids of predecessors
+  SmallVector<TaskDependInfo, 2> TaskDepInfo; // Task dependency information
+  // SmallVector<int64_t> FirstPrivateData;
+};
+
 } // namespace omp
 
 /// OpenMP optimizations pass.
