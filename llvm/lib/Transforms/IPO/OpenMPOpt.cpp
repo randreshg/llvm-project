@@ -5120,19 +5120,19 @@ private:
 
 
 // TDG Info
-struct AATDGInfo : public StateWrapper<BooleanState, AbstractAttribute> {
+struct AATaskInfo : public StateWrapper<BooleanState, AbstractAttribute> {
   using Base = StateWrapper<BooleanState, AbstractAttribute>;
 
-  AATDGInfo(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
+  AATaskInfo(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
 
   /// Statistics are tracked as part of manifest for now.
   void trackStatistics() const override {}
 
-  static AATDGInfo &createForPosition(const IRPosition &IRP,
+  static AATaskInfo &createForPosition(const IRPosition &IRP,
                                             Attributor &A);
 
   /// See AbstractAttribute::getName()
-  const std::string getName() const override { return "AATDGInfo"; }
+  const std::string getName() const override { return "AATaskInfo"; }
 
   /// See AbstractAttribute::getIdAddr()
   const char *getIdAddr() const override { return &ID; }
@@ -5150,16 +5150,16 @@ struct AATDGInfo : public StateWrapper<BooleanState, AbstractAttribute> {
 };
 
 
-struct AATDGCallSite : AATDGInfo {
-  AATDGCallSite(const IRPosition &IRP, Attributor &A)
-      : AATDGInfo(IRP, A) {}
+struct AATaskInfoCallSite : AATaskInfo {
+  AATaskInfoCallSite(const IRPosition &IRP, Attributor &A)
+      : AATaskInfo(IRP, A) {}
 
   /// See AbstractAttribute::getAsStr()
   const std::string getAsStr() const override {
     if (!isValidState())
       return "<invalid>";
 
-    std::string Str("AATDGInfo: ");
+    std::string Str("AATaskInfo: ");
 
     return Str + std::string("unknown");
   }
@@ -5174,14 +5174,14 @@ struct AATDGCallSite : AATDGInfo {
     /// Allocate task
     TI = new TaskInfo();
     TI->TaskCB = TaskCallBase;
-    LLVM_DEBUG(dbgs() << "[TDGInfo] Called: " << TaskFunction->getName() << "\n");
+    LLVM_DEBUG(dbgs() << "[TaskInfo] Called: " << TaskFunction->getName() << "\n");
     // Get dep num
     ConstantInt *DepNumArg = cast<ConstantInt>(TaskCallBase->getArgOperand(DepNumArgNo));
     int64_t DepNum = DepNumArg->getSExtValue();
     TI->TaskDepInfo.resize(DepNum);
-    LLVM_DEBUG(dbgs() << "[TDGInfo] DepNum: " << DepNum << "\n");
+    LLVM_DEBUG(dbgs() << "[TaskInfo] DepNum: " << DepNum << "\n");
   
-    LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] Analysis started\n");
+    LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] Analysis started\n");
     // For purposes of this analysis, we will assume the DepListArg is not captured
     TaskCallBase->addParamAttr(DepListArgNo, Attribute::NoCapture);
     auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
@@ -5195,10 +5195,10 @@ struct AATDGCallSite : AATDGInfo {
       DepClassTy::NONE);
     /// Check state
     if(!PI.getState().isValidState()) {
-      LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] PI is invalid\n");
+      LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] PI is invalid\n");
       indicatePessimisticFixpoint();
     }
-    LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] forallInterferingAccesses finished" << "\n");
+    LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] forallInterferingAccesses finished" << "\n");
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
@@ -5209,7 +5209,7 @@ struct AATDGCallSite : AATDGInfo {
   ChangeStatus manifest(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
 
-    LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] Manifest\n");
+    LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] Manifest\n");
     CallBase *TaskCallBase = TI->TaskCB;
     auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
     auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
@@ -5218,7 +5218,7 @@ struct AATDGCallSite : AATDGInfo {
       IRPosition::value(*DepListAlloca),
       this, DepClassTy::NONE);
     if(!PI) {
-      LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] PI is invalid\n");
+      LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] PI is invalid\n");
       return Changed;
     }
 
@@ -5294,24 +5294,24 @@ struct AATDGCallSite : AATDGInfo {
     TaskCallBase->removeParamAttr(DepListArgNo, Attribute::NoCapture);
 
     // -------------------------------------------------------
-    // printf("----------\n[TDGInfo][MemSSA] Analysis started\n");
+    // printf("----------\n[TaskInfo][MemSSA] Analysis started\n");
     // // Get caller of taskfunction
     // Function *CallerFunction = (Function *)TaskCallBase->getCaller();
-    // printf("[TDGInfo][MemSSA] Caller: %s\n", CallerFunction->getName().str().c_str());
+    // printf("[TaskInfo][MemSSA] Caller: %s\n", CallerFunction->getName().str().c_str());
     // // Get AnalysisGetter
     // auto &AG = A.getInfoCache().getAnalysisGetter();
     // auto result= A.getAnalysisResultForFunction<MemorySSAAnalysis>(*CallerFunction);
     // auto result2= AG.getAnalys<MemorySSAAnalysis>(*TaskFunction);
     // auto analysis = AG.getAnalysis<MemorySSAAnalysis>(CallerFunction);
     // MemorySSA &MSSA = .getMSSA();
-    // // printf("[TDGInfo][MemSSA] Analysis finished\n----------\n");
+    // // printf("[TaskInfo][MemSSA] Analysis finished\n----------\n");
     
     return Changed;
   }
 
   ChangeStatus indicatePessimisticFixpoint() override {
     //SimplifiedValue = nullptr;
-    return AATDGInfo::indicatePessimisticFixpoint();
+    return AATaskInfo::indicatePessimisticFixpoint();
   }
 
 private:
@@ -5356,8 +5356,8 @@ void OpenMPOpt::getTaskLists() {
     CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &RFI);
     if (!CI)
       return false;
-    /// Retrieve TDGInfo
-    auto *TDGI = A.lookupAAFor<AATDGInfo>(
+    /// Retrieve TaskInfo
+    auto *TDGI = A.lookupAAFor<AATaskInfo>(
       IRPosition::callsite_returned(*CI),
       nullptr, DepClassTy::NONE);
 
@@ -5396,7 +5396,7 @@ void OpenMPOpt::getTaskLists() {
 }
 
 void OpenMPOpt::registerTDGAA() {
-  LLVM_DEBUG(dbgs() << "[OpenMPOpt] [TDGInfo] Registering AATDGInfo\n");
+  LLVM_DEBUG(dbgs() << "[OpenMPOpt] [TaskInfo] Registering AATaskInfo\n");
   OMPInformationCache::RuntimeFunctionInfo &RFI = 
       OMPInfoCache.RFIs[OMPRTL___kmpc_omp_task_with_deps];
   /// For each use of the runtime function, get the task info.
@@ -5404,7 +5404,7 @@ void OpenMPOpt::registerTDGAA() {
     CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &RFI);
     if (!CI)
       return false;
-    A.getOrCreateAAFor<AATDGInfo>(
+    A.getOrCreateAAFor<AATaskInfo>(
         IRPosition::callsite_returned(*CI), /* QueryingAA */ nullptr,
         DepClassTy::NONE, /* ForceUpdate */ false,
         /* UpdateAfterInit */ false);
@@ -5524,7 +5524,7 @@ const char AAKernelInfo::ID = 0;
 const char AAExecutionDomain::ID = 0;
 const char AAHeapToShared::ID = 0;
 const char AAFoldRuntimeCall::ID = 0;
-const char AATDGInfo::ID = 0;
+const char AATaskInfo::ID = 0;
 
 AAICVTracker &AAICVTracker::createForPosition(const IRPosition &IRP,
                                               Attributor &A) {
@@ -5636,9 +5636,9 @@ AAFoldRuntimeCall &AAFoldRuntimeCall::createForPosition(const IRPosition &IRP,
   return *AA;
 }
 
-AATDGInfo &AATDGInfo::createForPosition(const IRPosition &IRP,
-                                        Attributor &A) {
-  AATDGInfo *AA = nullptr;
+AATaskInfo &AATaskInfo::createForPosition(const IRPosition &IRP,
+                                         Attributor &A) {
+  AATaskInfo *AA = nullptr;
   switch (IRP.getPositionKind()) {
     case IRPosition::IRP_INVALID:
     case IRPosition::IRP_FLOAT:
@@ -5647,9 +5647,9 @@ AATDGInfo &AATDGInfo::createForPosition(const IRPosition &IRP,
     case IRPosition::IRP_FUNCTION:
     case IRPosition::IRP_CALL_SITE:
     case IRPosition::IRP_CALL_SITE_ARGUMENT:
-      llvm_unreachable("TDGInfo can only be created for call site position!");
+      llvm_unreachable("TaskInfo can only be created for call site position!");
     case IRPosition::IRP_CALL_SITE_RETURNED:
-      AA = new (A.Allocator) AATDGCallSite(IRP, A);
+      AA = new (A.Allocator) AATaskInfoCallSite(IRP, A);
       break;
   }
     return *AA;
