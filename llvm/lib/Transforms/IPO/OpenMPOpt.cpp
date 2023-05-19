@@ -542,6 +542,9 @@ struct OMPInformationCache : public InformationCache {
   /// Collection of known kernels (\see Kernel) in the module.
   KernelSet &Kernels;
 
+  /// Collection of known tasks in the module.
+  // TaskSet &Tass;
+
   /// Collection of known OpenMP runtime functions..
   DenseSet<const Function *> RTLFunctions;
 
@@ -845,9 +848,12 @@ struct OpenMPOpt {
 
     if (IsModulePass) {
       Changed |= runAttributor(IsModulePass);
-
+      
       // Recollect uses, in case Attributor deleted any.
       OMPInfoCache.recollectUses();
+
+      // Get task list
+      getTaskLists();
 
       // TODO: This should be folded into buildCustomStateMachine.
       Changed |= rewriteDeviceCodeStateMachine();
@@ -864,6 +870,7 @@ struct OpenMPOpt {
 
       // Recollect uses, in case Attributor deleted any.
       OMPInfoCache.recollectUses();
+      
 
       Changed |= deleteParallelRegions();
 
@@ -1926,7 +1933,9 @@ private:
 
   void registerFoldRuntimeCall(RuntimeFunction RF);
 
+  /// TDGAA
   void registerTDGAA();
+  void getTaskLists();  // It has to run after AA is done.
 
   /// Populate the Attributor with abstract attribute opportunities in the
   /// functions.
@@ -5135,6 +5144,9 @@ struct AATDGInfo : public StateWrapper<BooleanState, AbstractAttribute> {
   }
 
   static const char ID;
+
+  /// Task Info
+  TaskInfo *TI;
 };
 
 
@@ -5159,9 +5171,9 @@ struct AATDGCallSite : AATDGInfo {
       indicatePessimisticFixpoint();
       return;
     }
-    LLVM_DEBUG(dbgs()<<"\n------------------------------------------\n");
     /// Allocate task
     TI = new TaskInfo();
+    TI->TaskCB = TaskCallBase;
     LLVM_DEBUG(dbgs() << "[TDGInfo] Called: " << TaskFunction->getName() << "\n");
     // Get dep num
     ConstantInt *DepNumArg = cast<ConstantInt>(TaskCallBase->getArgOperand(DepNumArgNo));
@@ -5187,7 +5199,6 @@ struct AATDGCallSite : AATDGInfo {
       indicatePessimisticFixpoint();
     }
     LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] forallInterferingAccesses finished" << "\n");
-    LLVM_DEBUG(dbgs()<<"\n------------------------------------------\n");
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
@@ -5199,7 +5210,7 @@ struct AATDGCallSite : AATDGInfo {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
 
     LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] Manifest\n");
-    CallBase *TaskCallBase = dyn_cast<CallBase>(&getAnchorValue());
+    CallBase *TaskCallBase = TI->TaskCB;
     auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
     auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
     //  Retrieve PI
@@ -5243,11 +5254,11 @@ struct AATDGCallSite : AATDGInfo {
             }
             else if (auto *CI = dyn_cast<ConstantInt>(Value)) {
               auto ConstantVal = CI->getSExtValue();
-              // LLVM_DEBUG(dbgs() << "       - Value:"<<ConstantVal<<"\n");
+              LLVM_DEBUG(dbgs() << "       - Value:"<<ConstantVal<<"\n");
               if (ElemItr == 1)
-                Dep.len = ConstantVal;
+                Dep.BaseLen = ConstantVal;
               else if (ElemItr == 2)
-                Dep.flag = (uint8_t)ConstantVal;
+                Dep.Flag = ConstantVal;
               else {
                 LLVM_DEBUG(dbgs() << "Store not supported\n");
                 return false;
@@ -5282,66 +5293,6 @@ struct AATDGCallSite : AATDGInfo {
     // Remove NoCapture attribute... Do I have to report this change after manifest?
     TaskCallBase->removeParamAttr(DepListArgNo, Attribute::NoCapture);
 
-    // auto CheckAccessCB = [&](const AAPointerInfo::Access &Acc, bool IsExact) {
-    //   // Store instruction
-    //   if(auto *SI = dyn_cast<StoreInst>(Acc.getRemoteInst())) {
-    //     // Print store value
-    //     Value *V = SI->getValueOperand();
-    //     if (!V)
-    //       return false;
-    //     printf("Store value: %s\n", V->getName().str().c_str());
-    //     return true;
-    //   }
-    //   else if (auto *LI = dyn_cast<LoadInst>(Acc.getRemoteInst())) {
-    //     if (!Acc.isWrittenValueUnknown()) {
-    //       Value *V = Acc.getWrittenValue();
-    //       if (!V)
-    //         return false;
-    //       // Print load value
-    //       printf("Load value: %s\n", V->getName().str().c_str());
-    //       return true;
-    //     }
-    //   }
-    //   else {
-    //     printf("NOT A STORE OR LOAD\n");
-    //     // assert(isa<StoreInst>(I) && "Expected load or store instruction only!");
-    //     // auto *LI = dyn_cast<LoadInst>(Acc.getRemoteInst());
-    //     // if (!LI && OnlyExact) {
-    //     //   LLVM_DEBUG(dbgs() << "Underlying object read through a non-load "
-    //     //                        "instruction not supported yet: "
-    //     //                     << *Acc.getRemoteInst() << "\n";);
-    //     //   return false;
-    //     // }
-    //   }
-    //   // printf("Access: %s\n", Acc.getAccessInstruction()->getName().str().c_str());
-    //   LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] CheckAccess\n");
-    //   return false;
-    // };
-
-    // -------------------------------------------------------
-    // auto *DepListArg = TaskCallBase->getArgOperand(DepListArgNo);
-    // // For most of the cases, this is already an alloca instruction, for other
-    // // cases, it is GEPInst (at least when OPT=0)
-    // // auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
-    // Instruction *I = cast<Instruction>(DepListArg);
-    // LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] forallInterferingAccesses started" << "\n");
-    // if (!PI.forallInterferingAccesses(A, *this, *I,
-    //                                   /* FindInterferingWrites */ true,
-    //                                   /* FindInterferingReads */ true,
-    //                                   CheckAccessCB, HasBeenWrittenTo, Range)) {
-    //   LLVM_DEBUG(dbgs() << "[TDGInfo][AAPointerInfo] NOT WORKING\n");
-    //   LLVM_DEBUG(
-    //     dbgs()
-    //     << "Failed to verify all interfering accesses for the instruction\n");
-    //   return;
-    // }
-    // if(!PI.forallOffsetBins(simpleCB)) {
-    //   LLVM_DEBUG(
-    //     dbgs()
-    //     << "Failed to verify all Offset bins for the instruction\n");
-    // }
-
-
     // -------------------------------------------------------
     // printf("----------\n[TDGInfo][MemSSA] Analysis started\n");
     // // Get caller of taskfunction
@@ -5364,13 +5315,10 @@ struct AATDGCallSite : AATDGInfo {
   }
 
 private:
-  /// The runtime function kind of the callee of the associated call site.
-  // RuntimeFunction RFKind;
-  TaskInfo *TI;
   ///  Information about the TaskDependInfo struct
   const int64_t StructSize = 24;
   const int64_t StructAlign = 8;
-  const int64_t StructElem = StructSize/StructAlign;
+  // const int64_t StructElem = StructSize/StructAlign;
   /// Task arguments
   const unsigned int DepNumArgNo = 3;
   const unsigned int DepListArgNo = 4;
@@ -5394,11 +5342,64 @@ void OpenMPOpt::registerFoldRuntimeCall(RuntimeFunction RF) {
   });
 }
 
+void OpenMPOpt::getTaskLists() {
+
+  LLVM_DEBUG(dbgs() << "[OpenMPOpt] Get Task lists\n");
+  /// Collection of known tasks in the module.
+  TaskSet Tasks;
+  
+  /// Collection of known task functions in the module.
+  OMPInformationCache::RuntimeFunctionInfo &RFI = 
+      OMPInfoCache.RFIs[OMPRTL___kmpc_omp_task_with_deps];
+  /// For each use of the runtime function, get the task info.
+  RFI.foreachUse(SCC, [&](Use &U, Function &F) {
+    CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &RFI);
+    if (!CI)
+      return false;
+    /// Retrieve TDGInfo
+    auto *TDGI = A.lookupAAFor<AATDGInfo>(
+      IRPosition::callsite_returned(*CI),
+      nullptr, DepClassTy::NONE);
+
+    if(!TDGI) {
+      LLVM_DEBUG(dbgs() << "[OpenMPOpt] TDGI is invalid\n");
+      return false;
+    }
+    /// Insert task
+    Tasks.insert(TDGI->TI);
+    return false;
+  });
+
+  /// Print tasks
+  LLVM_DEBUG(dbgs() << "\nTASKS: " <<Tasks.size()<< "\n");
+  int TaskItr = 0;
+  for(auto *TI:Tasks) {
+    /// Print TI info
+    LLVM_DEBUG(dbgs() << "\n TASK #"<< TaskItr++ << "\n");
+    LLVM_DEBUG(dbgs() << "  TaskCB: " << *TI->TaskCB << "\n");
+    LLVM_DEBUG(dbgs() << "  TaskDep size: " << TI->TaskDepInfo.size() << "\n");
+    for (auto Dep: TI->TaskDepInfo) {
+      LLVM_DEBUG(dbgs() << "  TaskDep \n");
+      LLVM_DEBUG(dbgs() << "    BasePtr: " << *Dep.BasePtr << "\n");
+      LLVM_DEBUG(dbgs() << "    BaseLen: " << Dep.BaseLen << "\n");
+      LLVM_DEBUG(dbgs() << "    Depend: " << (uint) Dep.Flag << "->");
+      if(Dep.Flags.in == 1)
+        LLVM_DEBUG(dbgs() << "  Input, ");
+      if(Dep.Flags.out == 1)
+        LLVM_DEBUG(dbgs() << "  Output, ");
+      if(Dep.Flags.mtx == 1)
+        LLVM_DEBUG(dbgs() << "  Mutex, "); 
+      LLVM_DEBUG(dbgs() << "\n");
+    }
+  }
+  LLVM_DEBUG(dbgs() << "\n");
+}
+
 void OpenMPOpt::registerTDGAA() {
   LLVM_DEBUG(dbgs() << "[OpenMPOpt] [TDGInfo] Registering AATDGInfo\n");
   OMPInformationCache::RuntimeFunctionInfo &RFI = 
       OMPInfoCache.RFIs[OMPRTL___kmpc_omp_task_with_deps];
-  // For each use of the runtime function, get the task info.
+  /// For each use of the runtime function, get the task info.
   RFI.foreachUse(SCC, [&](Use &U, Function &F) {
     CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &RFI);
     if (!CI)

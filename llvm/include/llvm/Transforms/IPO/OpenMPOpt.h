@@ -33,34 +33,35 @@ bool isOpenMPDevice(Module &M);
 KernelSet getDeviceKernels(Module &M);
 
 /// Tasks structures and typedefs extracted from kmp.h
-typedef int kmp_int32;
-typedef int64_t kmp_int64;
-typedef intptr_t kmp_intptr_t;
 typedef unsigned char uint8;
 
 typedef struct kmp_depend_info {
-  Value *base_addr;
-  size_t len;
+  Value *BasePtr;               // Alloca instruction of the base pointer
+  size_t BaseLen;               // Size of the base pointer
   union {
-    uint8 flag; // flag as an unsigned char
-    struct { // flag as a set of 8 bits
+    uint8 Flag;                 // Flag as an unsigned char
+    struct {                    // Flag as a set of 8 bits
       unsigned in : 1;
       unsigned out : 1;
       unsigned mtx : 1;
       unsigned set : 1;
       unsigned unused : 3;
       unsigned all : 1;
-    } flags;
+    } Flags;
   };
 } TaskDependInfo;
 
 struct TaskInfo {
-  int id;                                     // Task id
-  SmallVector<uint64_t, 2> successors;        // Ids of successors
-  SmallVector<uint64_t, 2> predecessors;      // Ids of predecessors
+  CallBase *TaskCB = nullptr;
+  // int id;                                     // Task id
+  // SmallVector<uint64_t, 2> successors;        // Ids of successors
+  // SmallVector<uint64_t, 2> predecessors;      // Ids of predecessors
   SmallVector<TaskDependInfo, 2> TaskDepInfo; // Task dependency information
   // SmallVector<int64_t> FirstPrivateData;
 };
+
+/// Set of kernels in the module
+using TaskSet = SetVector<TaskInfo *>;
 
 } // namespace omp
 
