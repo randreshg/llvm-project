@@ -35,9 +35,12 @@ KernelSet getDeviceKernels(Module &M);
 /// Tasks structures and typedefs extracted from kmp.h
 typedef unsigned char uint8;
 
+/// Task dependency information
 typedef struct kmp_depend_info {
   Value *BasePtr;               // Alloca instruction of the base pointer
   size_t BaseLen;               // Size of the base pointer
+  // Offset for array section
+  // Size -> infinite...
   union {
     uint8 Flag;                 // Flag as an unsigned char
     struct {                    // Flag as a set of 8 bits
@@ -51,17 +54,36 @@ typedef struct kmp_depend_info {
   };
 } TaskDependInfo;
 
+/// Task information
 struct TaskInfo {
+  TaskInfo(CallBase *TaskCB, bool HasDep) : TaskCB(TaskCB), HasDep(HasDep) {}
+
   CallBase *TaskCB = nullptr;
+  bool HasDep = false;
   // int id;                                     // Task id
-  // SmallVector<uint64_t, 2> successors;        // Ids of successors
-  // SmallVector<uint64_t, 2> predecessors;      // Ids of predecessors
+  SmallVector<uint64_t, 2> successors;        // Ids of successors
+  SmallVector<uint64_t, 2> predecessors;      // Ids of predecessors
   SmallVector<TaskDependInfo, 2> TaskDepInfo; // Task dependency information
   // SmallVector<int64_t> FirstPrivateData;
 };
 
+/// Task dependency graph
+// class TaskDependencyGraph {
+// SmallVector<TaskInfo *> Tasks;
+
+// public:
+//   bool addTask(TaskInfo &TaskFound) {
+//     Tasks.push_back(&TaskFound);
+//     return true;
+//   }
+//   bool checkDependency(TaskDependInfo &Source, TaskDependInfo &Dest);
+//   void addTaskDependInfo(TaskInfo &TaskFound, CallInst &TaskCall);
+// };
+
 /// Set of kernels in the module
-using TaskSet = SetVector<TaskInfo *>;
+using TaskSet = SmallVector<TaskInfo>;
+///  Map from callbase to its position in the taskset
+using TaskMap = DenseMap<CallBase *, int>;
 
 } // namespace omp
 
