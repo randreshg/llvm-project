@@ -36,7 +36,7 @@ KernelSet getDeviceKernels(Module &M);
 typedef unsigned char uint8;
 
 /// Task dependency information
-typedef struct kmp_depend_info {
+typedef struct TaskDependInfo {
   Value *BasePtr;               // Alloca instruction of the base pointer
   size_t BaseLen;               // Size of the base pointer
   // Offset for array section
@@ -54,31 +54,57 @@ typedef struct kmp_depend_info {
   };
 } TaskDependInfo;
 
-/// Task information
+/// Task information. It basically has what we know about a task.
+/// We can consider adding more information such as private variables, 
+/// shared variables, etc.
 struct TaskInfo {
-  TaskInfo(CallBase *TaskCB, bool HasDep) : TaskCB(TaskCB), HasDep(HasDep) {}
+  TaskInfo(uint64_t ID, CallBase *CB, bool HasDep) :
+    ID(ID), CB(CB), HasDep(HasDep) {}
 
-  CallBase *TaskCB = nullptr;
-  bool HasDep = false;
-  // int id;                                     // Task id
-  SmallVector<uint64_t, 2> successors;        // Ids of successors
-  SmallVector<uint64_t, 2> predecessors;      // Ids of predecessors
-  SmallVector<TaskDependInfo, 2> TaskDepInfo; // Task dependency information
-  // SmallVector<int64_t> FirstPrivateData;
+  uint64_t ID;
+  CallBase *CB = nullptr;
+  bool HasDep;
+  SmallVector<TaskDependInfo, 2> DepInfo;
+  SmallVector<uint64_t, 2> Successors;
+  SmallVector<uint64_t, 2> Predecessors;
+
+  void addSuccessor(uint64_t Id) { Successors.push_back(Id);}
+  void addPredecessor(uint64_t Id) { Predecessors.push_back(Id);}
 };
 
-/// Task dependency graph
-// class TaskDependencyGraph {
-// SmallVector<TaskInfo *> Tasks;
+typedef struct DependInfo {
+  enum DepType {
+    RAW,
+    WAW,
+    WAR,
+    UNKNOWN
+  };
+  DepType Type;
+  TaskInfo *Source;
+  TaskInfo *Dest;
 
-// public:
-//   bool addTask(TaskInfo &TaskFound) {
-//     Tasks.push_back(&TaskFound);
-//     return true;
-//   }
-//   bool checkDependency(TaskDependInfo &Source, TaskDependInfo &Dest);
-//   void addTaskDependInfo(TaskInfo &TaskFound, CallInst &TaskCall);
-// };
+  DependInfo(DepType Type, TaskInfo *Source, TaskInfo *Dest) :
+    Type(Type), Source(Source), Dest(Dest) {}
+} DependInfo;
+
+/// Task dependency graph
+class TaskDependencyGraph {
+  SmallVector<TaskInfo*> Tasks;
+  SmallVector<DependInfo> Deps;
+
+  public:
+    void addTDG(const TaskDependencyGraph &TDG);
+    void addDependency(DependInfo::DepType Type, TaskInfo &Source, TaskInfo &Dest) {
+      DependInfo Dep(Type, &Source, &Dest);
+      Deps.push_back(Dep);
+    }
+    size_t getTaskSize() { return Tasks.size(); }
+    size_t getDepSize() { return Deps.size(); }
+    bool addTask(TaskInfo &TaskFound);
+    bool checkDependency(TaskDependInfo &Source, TaskDependInfo &Dest);
+    void addTaskDependInfo(TaskInfo &TaskFound, CallInst &TaskCall);
+    void dump();
+};
 
 /// Set of kernels in the module
 using TaskSet = SmallVector<TaskInfo>;
