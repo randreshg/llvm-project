@@ -5209,6 +5209,7 @@ struct AATaskInfo : public StateWrapper<BooleanState, AbstractAttribute> {
   }
 
   static const char ID;
+  TaskInfo *TI = nullptr;
 };
 
 /// Call site information for a task call site.
@@ -5223,7 +5224,7 @@ struct AATaskInfoCallSite : AATaskInfo {
 
     std::string Str("AATaskInfo: ");
 
-    return Str + std::string("unknown");
+    return Str + std::string("OK");
   }
 
   void initialize(Attributor &A) override {
@@ -5236,49 +5237,60 @@ struct AATaskInfoCallSite : AATaskInfo {
     }
     /// Get task from cache
     auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
-    auto &TI = OMPInfoCache.getTaskInfo(&TaskCallBase);
-    // /// If the TaskCallBase it is not in our cache, we have to give up
-    // if (!TI) {
-    //   indicatePessimisticFixpoint();
-    //   return;
-    // }
-
+    TI = &OMPInfoCache.getTaskInfo(&TaskCallBase);
     LLVM_DEBUG(dbgs() << "[TaskInfo] Called: " << TaskFunction->getName() << "\n");
+
     /// If the task doesnt have dependencies, we dont have to do anything else here
     /// For now, we assume, this task is side-effect free
-    if (!TI.HasDep) {
+    if (!TI->HasDep) {
       indicateOptimisticFixpoint();
       return;
     }
 
-    // Get dep num
+    /// Get dep num
     ConstantInt *DepNumArg = cast<ConstantInt>(TaskCallBase.getArgOperand(DepNumArgNo));
     int64_t DepNum = DepNumArg->getSExtValue();
-    TI.DepInfo.resize(DepNum);
+    TI->DepInfo.resize(DepNum);
     LLVM_DEBUG(dbgs() << "[TaskInfo] DepNum: " << DepNum << "\n");
   
     LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] Analysis started\n");
-    // For purposes of this analysis, we will assume the DepListArg is not captured
+    /// For purposes of this analysis, we will assume the DepListArg is not captured
     auto *DepListArg = TaskCallBase.getArgOperand(DepListArgNo);
-    auto *DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
+    TI->DepListAlloca = cast<AllocaInst>(getUnderlyingObject(DepListArg));
+    LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] DepListAlloca: " << *TI.DepListAlloca << "\n");
     TaskCallBase.addParamAttr(DepListArgNo, Attribute::NoCapture);
-    // Get the pointer info
+    /// Get the pointer info
     auto &PI = A.getAAFor<AAPointerInfo>(
-      *this, 
-      IRPosition::value(*DepListAlloca),
-      DepClassTy::NONE);
-    TaskCallBase.removeParamAttr(DepListArgNo, Attribute::NoCapture);
-  
+      *this, IRPosition::value(*TI->DepListAlloca), DepClassTy::REQUIRED);
+
     /// Check state
     if(!PI.getState().isValidState()) {
       LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] PI is invalid\n");
       indicatePessimisticFixpoint();
     }
+    LLVM_DEBUG(dbgs() << "[TaskInfo] Initialized finished" << "\n");
+  }
 
-    /// There exists the possibility that PI is not ready yet. 
-    /// In this case, we need to wait for it to be ready.
-    /// We can do this by adding a dependence on PI
-    /// For now, we will assume everything is ready
+  ChangeStatus updateImpl(Attributor &A) override {
+    LLVM_DEBUG(dbgs() << "[TaskInfo] updateImpl" << "\n");
+    /// Get task from cache
+    CallBase &TaskCallBase = cast<CallBase>(getAssociatedValue());
+    // auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
+    // auto &TI = OMPInfoCache.getTaskInfo(&TaskCallBase);
+    /// Look up the pointer info
+    auto *PI = A.lookupAAFor<AAPointerInfo>(
+      IRPosition::value(*TI->DepListAlloca), this, DepClassTy::REQUIRED);
+    /// If the pointer info AA is not valid, we give up
+    if(!PI->getState().isValidState()) {
+      LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo][updateImpl] PI is invalid\n");
+      indicatePessimisticFixpoint();
+    }  
+    /// Print number of offsets bins
+    LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo][updateImpl] OffsetBins: " << PI->getOffsetBinsSize() << "\n");
+    if(PI->getOffsetBinsSize() == 0)
+      return ChangeStatus::UNCHANGED;
+
+    /// Analyzes the access for each offset bin. If the access fails (e.g. when the dep value is unknown), we give up and return false
     auto accessCB = [&](const AA::RangeTy& Range, const SmallSet<unsigned, 4>& AccIndex) {
       LLVM_DEBUG(dbgs() << "[" << Range.Offset << "-" << Range.Offset + Range.Size
         << "] : " << AccIndex.size() << "\n");
@@ -5287,7 +5299,7 @@ struct AATaskInfoCallSite : AATaskInfo {
       LLVM_DEBUG(dbgs() << "Size: "<< TI.DepInfo.size()<<" [" << DepItr << "-" << ElemItr << "]\n");
 
       for (auto AI : AccIndex) {
-        auto &Acc = PI.getAccess(AI);
+        auto &Acc = PI->getAccess(AI);
         LLVM_DEBUG(dbgs() << "     - " << Acc.getKind() << " - " << *Acc.getLocalInst() << "\n");
         /// Store instruction
         if(Acc.getKind() == AAPointerInfo::AccessKind::AK_MUST_WRITE) {
@@ -5295,7 +5307,11 @@ struct AATaskInfoCallSite : AATaskInfo {
             LLVM_DEBUG(dbgs() << "     -->                         " << *Acc.getRemoteInst()
               << "\n");
 
-          if (auto *Value = Acc.getWrittenValue()) {
+          if(Acc.isWrittenValueYetUndetermined()) {
+            LLVM_DEBUG(dbgs() << "       - c: Value written is not known yet \n");
+            return false;
+          }
+          else if (auto *Value = Acc.getWrittenValue()) {
             LLVM_DEBUG(dbgs() << "       - c: " << *Acc.getWrittenValue() << "\n");
             auto &Dep = TI.DepInfo[DepItr];
             if(auto *PtII = dyn_cast<PtrToIntInst>(Value)) {
@@ -5337,32 +5353,28 @@ struct AATaskInfoCallSite : AATaskInfo {
           LLVM_DEBUG(dbgs() << "       - Value undetermined\n");
           return false;
         }
-        
       }
       return true;
     };
 
-    if(!PI.forallOffsetBins(accessCB)) {
-      LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] PI forallOffsetBins failed\n");
-      indicatePessimisticFixpoint();
-      return;
+    if(!PI->forallOffsetBins(accessCB)) {
+      LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo][updateImpl] PI forallOffsetBins failed\n");
+      return ChangeStatus::UNCHANGED;
     }
-
-    // If we reach this point, we have successfully analyzed the task
+    
+    LLVM_DEBUG(dbgs() << "[TaskInfo] updateImpl finished" << "\n");
+    TaskCallBase.removeParamAttr(DepListArgNo, Attribute::NoCapture);
+    /// If we reach this point it means that we successfully analyzed the task and got
+    /// the information we need. This will trigger an update on the parent AA.
     indicateOptimisticFixpoint();
-    LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] Analysis finished" << "\n");
-  }
-
-  ChangeStatus updateImpl(Attributor &A) override {
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    LLVM_DEBUG(dbgs() << "[TaskInfo] updateImpl" << "\n");
-    return Changed;
+    return ChangeStatus::CHANGED;
   }
 
   ChangeStatus manifest(Attributor &A) override {
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    // ChangeStatus Changed = ChangeStatus::UNCHANGED;
     LLVM_DEBUG(dbgs() << "[TaskInfo] Manifest\n");
-    return Changed;
+    
+    return ChangeStatus::UNCHANGED;
   }
 
 private:
@@ -5422,10 +5434,11 @@ struct AATDGInfoFunction : AATDGInfo {
   void initialize(Attributor &A) override {
     Function *F = getAnchorScope();
     bool InitializingTask, BuildingTDG;
-  
+    LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] ----------------------------------\n");
     LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] initialize: " << F->getName() << "\n");
     /// For each BB of the function
     for (auto &BB : *F) {
+      LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] -----------\n");
       LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] BasicBlock: " << BB << "\n");
       InitializingTask = false;
       BuildingTDG = false;
@@ -5443,18 +5456,18 @@ struct AATDGInfoFunction : AATDGInfo {
             /// For all other CB create a TDGGInfo callsite
             LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] It is a callbase instruction\n");
             auto &TDGInfoCS = A.getAAFor<AATDGInfo>(
-                *this, IRPosition::callsite_function(*CB), DepClassTy::NONE);
+                *this, IRPosition::callsite_function(*CB), DepClassTy::OPTIONAL);
             /// If the TDGInfoCS fails, it means that the callsite is not valid.
             /// This can happen when we reached a point where we can not longer build a TDG,
             /// such as a function we dont know about, an invalid task, a RT function we do 
             /// not provide support yet, or a function with no tasks that we couldn't taskify.
             if (!TDGInfoCS.getState().isValidState()) {
-              // indicatePessimisticFixpoint();
-              /// We dont give up here, we just skip the current BB and 
+              /// We dont give up on the funtion here, we just skip the current BB and 
               /// continue with the next one.
               break;
             }
             /// If we reach this point, it means we were able to build a TDG for the callsite.
+            /// However, we can add it here to the TDG. We will do it in updateImpl.
             BuildingTDG = true;
             InitializingTask = false;
             LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] Add TDGInfoCS to TDG\n");
@@ -5478,15 +5491,20 @@ struct AATDGInfoFunction : AATDGInfo {
           /// HOW TO ADD IT THE CONTROL FLOW ISNTRUCTION TO THE TDG?
           /// - Jump/Branch inst?, how can we add it to the TDG?
           /// - Is it the last instruction of the BB? -> IMPORTANT
-          /// If already started to build the TDG, we just give up
+          /// If we already started to build the TDG, we just give up
           if(BuildingTDG)
             indicatePessimisticFixpoint();
         }
       }
       /// A function can have multiple TDGs, so we need to add a control flow
       /// instruction to the TDG. 
-      LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] Dump BB TDG\n");
-      TDG.dump();
+      if(BuildingTDG) {
+        LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] Dump BB TDG\n");
+        TDG.dump();
+      }
+      else {
+        LLVM_DEBUG(dbgs() <<"[AATDGInfoFunction] No TDG for BB\n");
+      }
     }
     /// If we didnt create any TDG node, it means that we have a function without tasks and
     /// we couldnt taskify it. So we give up.
@@ -5498,6 +5516,7 @@ struct AATDGInfoFunction : AATDGInfo {
   ChangeStatus updateImpl(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
     LLVM_DEBUG(dbgs() << "[AATDGInfoFunction] updateImpl" << "\n");
+
     return Changed;
   }
 
@@ -5520,7 +5539,7 @@ struct AATDGInfoCallSite : AATDGInfo {
 
     std::string Str("AATDGInfoCallSite: ");
 
-    return Str + std::string("unknown");
+    return Str + std::string("OK");
   }
 
   void initialize(Attributor &A) override {
@@ -5545,7 +5564,7 @@ struct AATDGInfoCallSite : AATDGInfo {
         return;
       }
       /// Since this is a function, the TDG returned has all dependencies
-      /// related to the function stack frame, so we need to update it and
+      /// related to the function scope, so we need to update it and
       /// find the "real" dependency. So we update dependencies using the caller
       /// parameters.
       Function *Caller = CB.getCaller();
@@ -5561,28 +5580,16 @@ struct AATDGInfoCallSite : AATDGInfo {
     case OMPRTL___kmpc_omp_task:
     case OMPRTL___kmpc_omp_task_with_deps: {
       /// Add task to the TDG
-      LLVM_DEBUG(dbgs() << "[AATDGInfoCallSite] Found task\n");
+      LLVM_DEBUG(dbgs() << "[AATDGInfoCallSite] Task found\n");
       /// Run AA on the task
-      auto &TI = A.getAAFor<AATaskInfo>(
-        *this, IRPosition::callsite_returned(CB), DepClassTy::NONE);
+      auto &TI = A.getAndUpdateAAFor<AATaskInfo>(
+        *this, IRPosition::callsite_returned(CB), DepClassTy::REQUIRED);
       /// Indicate pessimistic point if a task is not valid
       if (!TI.getState().isValidState()) {
         LLVM_DEBUG(dbgs() << "[AATDGInfoCallSite] TDGI is invalid\n");
         indicatePessimisticFixpoint();
         return;
       }
-
-      /// There is the possibility that TI is not ready yet.
-      /// In this case, we need to wait for it to be ready.
-      /// We can do this by adding a dependence on TI
-      /// For now, we will assume everything is ready
-
-      /// If it is valid, it means that we were able to get all the task
-      /// dependencies
-      LLVM_DEBUG(dbgs() <<"[AATDGInfoCallSite] It is a valid callsite\n");
-      /// Add the task to the TDG
-      TDG.addTask(OMPInfoCache.getTaskInfo(&CB));
-      indicateOptimisticFixpoint();
     } break;
 
     /// Sync points
@@ -5591,7 +5598,12 @@ struct AATDGInfoCallSite : AATDGInfo {
     case OMPRTL___kmpc_omp_taskwait_deps_51: {
       /// Add taskwait to the TDG
       LLVM_DEBUG(dbgs() << "[AATDGInfoCallSite] Found taskwait\n");
-      indicateOptimisticFixpoint();
+      /// For now, indicate pessimistic point
+      /// Eventually we need to add the information regarding the taskwait
+      /// as sucessors and predecessors of the tasks. One thing to consider 
+      /// that taskwait is not a barrier for all the tasks. We can also add
+      /// dependencies clauses to the taskwait, so we need to consider it.
+      indicatePessimisticFixpoint();
     } break;
 
     /// How are we going to handle the othe other runtime functions?
@@ -5603,9 +5615,22 @@ struct AATDGInfoCallSite : AATDGInfo {
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
     LLVM_DEBUG(dbgs() << "[AATDGInfoCallSite] updateImpl" << "\n");
-    return Changed;
+    
+    /// There is a dependency with AATaskInfo, so every time it changes, we need
+    /// to update the TDG. Look up the task info
+    auto *TIAA = A.lookupAAFor<AATaskInfo>(
+      IRPosition::callsite_returned(CB), this, DepClassTy::REQUIRED);
+    if (!TIAA || !TIAA->getState().isValidState()) {
+      LLVM_DEBUG(dbgs() << "[AATDGInfoCallSite] TaskInfo is invalid\n");
+      indicatePessimisticFixpoint();
+      return ChangeStatus::UNCHANGED;
+    }
+    /// If it is valid, it means that we were able to get all the task
+    /// dependencies.  Add the task to the TDG
+    TDG.addTask(TIAA->TI);
+    indicateOptimisticFixpoint();
+    return ChangeStatus::CHANGED;
   }
 
   ChangeStatus manifest(Attributor &A) override {

@@ -1042,6 +1042,8 @@ struct AAPointerInfoImpl
     return State::getAccess(Index);
   }
 
+  unsigned getOffsetBinsSize() const override { return OffsetBins.size(); }
+  
   bool forallOffsetBins(
     function_ref<bool(const AA::RangeTy&, const SmallSet<unsigned, 4>&)> CB)
     const override {

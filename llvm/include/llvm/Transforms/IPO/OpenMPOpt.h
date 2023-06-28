@@ -12,6 +12,7 @@
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/Instructions.h"
 
 namespace llvm {
 
@@ -63,6 +64,7 @@ struct TaskInfo {
 
   uint64_t ID;
   CallBase *CB = nullptr;
+  AllocaInst *DepListAlloca= nullptr;
   bool HasDep;
   SmallVector<TaskDependInfo, 2> DepInfo;
   SmallVector<uint64_t, 2> Successors;
