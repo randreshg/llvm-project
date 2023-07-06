@@ -1684,7 +1684,9 @@ struct Attributor {
   /// state, \p ToAA can be moved to a pessimistic fixpoint because it required
   /// information from \p FromAA but none are available anymore.
   void recordDependence(const AbstractAttribute &FromAA,
-                        const AbstractAttribute &ToAA, DepClassTy DepClass);
+                        const AbstractAttribute &ToAA, 
+                        DepClassTy DepClass, 
+                        bool RecordDuringInit = false);
 
   /// Introduce a new abstract attribute into the fixpoint analysis.
   ///
@@ -3219,6 +3221,12 @@ protected:
   ///
   /// \Return CHANGED if the internal state changed, otherwise UNCHANGED.
   ChangeStatus update(Attributor &A);
+
+  /// Hook for the Attributor to trigger an update of the internal state.
+  /// trigeringAA is a pointer to the AA that triggered the update.
+  AbstractAttribute *triggeringAA = nullptr;
+  AbstractAttribute *getTriggeringAA() const { return triggeringAA; }
+  void setTriggeringAA(AbstractAttribute *AA) { triggeringAA = AA; }
 
   /// Hook for the Attributor to trigger the manifestation of the information
   /// represented by the abstract attribute in the LLVM-IR.

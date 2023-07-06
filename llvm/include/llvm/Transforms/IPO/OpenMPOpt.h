@@ -105,7 +105,7 @@ class TaskDependencyGraph {
     bool addTask(TaskInfo &TaskFound);
     bool checkDependency(TaskDependInfo &Source, TaskDependInfo &Dest);
     void addTaskDependInfo(TaskInfo &TaskFound, CallInst &TaskCall);
-    void dump();
+    void dump() const;
 };
 
 /// Set of kernels in the module

@@ -990,7 +990,7 @@ ChangeStatus AbstractAttribute::update(Attributor &A) {
   if (getState().isAtFixpoint())
     return HasChanged;
 
-  LLVM_DEBUG(dbgs() << "[Attributor] Update: " << *this << "\n");
+  LLVM_DEBUG(dbgs() << "[Attributor] Update: " << this << "\n");
 
   HasChanged = updateImpl(A);
 
@@ -2004,6 +2004,7 @@ void Attributor::runTillFixpoint() {
         if (DepIt.getInt() == unsigned(DepClassTy::OPTIONAL)) {
           DEBUG_WITH_TYPE(VERBOSE_DEBUG_TYPE,
                           dbgs() << " - recompute: " << *DepAA);
+          DepAA->setTriggeringAA(InvalidAA);
           Worklist.insert(DepAA);
           continue;
         }
@@ -2021,9 +2022,16 @@ void Attributor::runTillFixpoint() {
 
     // Add all abstract attributes that are potentially dependent on one that
     // changed to the work list.
+    LLVM_DEBUG(dbgs() << "Updating dependencies... \n");
     for (AbstractAttribute *ChangedAA : ChangedAAs) {
-      for (auto &DepIt : ChangedAA->Deps)
-        Worklist.insert(cast<AbstractAttribute>(DepIt.getPointer()));
+      for (auto &DepIt : ChangedAA->Deps) {
+        AbstractAttribute *DepAA = cast<AbstractAttribute>(DepIt.getPointer());
+        LLVM_DEBUG(dbgs() << ChangedAA->getName() << ": " << ChangedAA
+                      << " -> "<< DepAA->getName() << ": "  << DepAA
+                      << "\n");
+        DepAA->setTriggeringAA(ChangedAA);
+        Worklist.insert(DepAA);
+      }
       ChangedAA->Deps.clear();
     }
 
@@ -2037,17 +2045,25 @@ void Attributor::runTillFixpoint() {
 
     // Update all abstract attribute in the work list and record the ones that
     // changed.
+    LLVM_DEBUG(dbgs() << "Updating worklist... \n");
     for (AbstractAttribute *AA : Worklist) {
       const auto &AAState = AA->getState();
-      if (!AAState.isAtFixpoint())
-        if (updateAA(*AA) == ChangeStatus::CHANGED)
+      LLVM_DEBUG(dbgs() << "[Attributor] ---Updating: " << AA->getName() << ": "<< AA<<" - Fixpoint: "<<AAState.isAtFixpoint()<<"\n");
+      if (!AAState.isAtFixpoint()) {
+        if (updateAA(*AA) == ChangeStatus::CHANGED) {
           ChangedAAs.push_back(AA);
+          LLVM_DEBUG(dbgs() << "[Attributor] ---Updating: " << AA->getName() << ": "<< AA<<" -> Changed - Num of dependencies: "<<AA->Deps.size()<<"\n");
+        }
+        else
+          LLVM_DEBUG(dbgs() << "[Attributor] ---Updating: " << AA->getName() << ": "<< AA<<" -> didnt change\n");
+      }
 
       // Use the InvalidAAs vector to propagate invalid states fast transitively
       // without requiring updates.
       if (!AAState.isValidState())
         InvalidAAs.insert(AA);
     }
+    LLVM_DEBUG(dbgs() << "Updating worklist finished \n");
 
     // Add attributes to the changed set if they have been created in the last
     // iteration.
@@ -2535,6 +2551,7 @@ ChangeStatus Attributor::updateAA(AbstractAttribute &AA) {
   assert(Phase == AttributorPhase::UPDATE &&
          "We can update AA only in the update stage!");
 
+  LLVM_DEBUG(dbgs() << "[Attributor] Update: " << AA.getName() << "\n");
   // Use a new dependence vector for this update.
   DependenceVector DV;
   DependenceStack.push_back(&DV);
@@ -2544,7 +2561,8 @@ ChangeStatus Attributor::updateAA(AbstractAttribute &AA) {
   bool UsedAssumedInformation = false;
   if (!isAssumedDead(AA, nullptr, UsedAssumedInformation,
                      /* CheckBBLivenessOnly */ true))
-    CS = AA.update(*this);
+      CS = AA.update(*this);
+    
 
   if (!AA.isQueryAA() && DV.empty() && !AA.getState().isAtFixpoint()) {
     // If the AA did not rely on outside information but changed, we run it
@@ -3135,22 +3153,33 @@ InformationCache::FunctionInfo::~FunctionInfo() {
 
 void Attributor::recordDependence(const AbstractAttribute &FromAA,
                                   const AbstractAttribute &ToAA,
-                                  DepClassTy DepClass) {
+                                  DepClassTy DepClass,
+                                  bool RecordDuringInit) {
   if (DepClass == DepClassTy::NONE)
     return;
   // If we are outside of an update, thus before the actual fixpoint iteration
   // started (= when we create AAs), we do not track dependences because we will
-  // put all AAs into the initial worklist anyway.
-  if (DependenceStack.empty())
+  // put all AAs into the initial worklist anyway, unless the flag RecordDuringInit
+  // is set.
+  if (DependenceStack.empty() && !RecordDuringInit)
     return;
   if (FromAA.getState().isAtFixpoint())
     return;
+  if(RecordDuringInit) {
+    /// Even if we are outside of an update, we still want to record the
+    /// dependence. This is useful for AAs that need to create plenty of other
+    /// AAs during their initialization and recover information from them during
+    /// their update.
+    auto &DepAAs = const_cast<AbstractAttribute &>(FromAA).Deps;
+    DepAAs.insert(AbstractAttribute::DepTy(
+      const_cast<AbstractAttribute *>(&ToAA), unsigned(DepClass)));
+    return;
+  }
   DependenceStack.back()->push_back({&FromAA, &ToAA, DepClass});
 }
 
 void Attributor::rememberDependences() {
   assert(!DependenceStack.empty() && "No dependences to remember!");
-
   for (DepInfo &DI : *DependenceStack.back()) {
     assert((DI.DepClass == DepClassTy::REQUIRED ||
             DI.DepClass == DepClassTy::OPTIONAL) &&
