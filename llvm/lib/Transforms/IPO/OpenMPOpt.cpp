@@ -5230,7 +5230,7 @@ struct AATaskInfoCallSite : AATaskInfo {
     return Str + std::string("OK");
   }
 
-  bool analyzePI(const AAPointerInfo &PI) {
+  bool analyzePI(Attributor &A, const AAPointerInfo &PI) {
     if(!PI.getState().isValidState()) {
       LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] PI is invalid\n");
       indicatePessimisticFixpoint();
@@ -5245,7 +5245,7 @@ struct AATaskInfoCallSite : AATaskInfo {
     /// we return false
     auto accessCB = [&](const AA::RangeTy& Range, const SmallSet<unsigned, 4>& AccIndex) {
       LLVM_DEBUG(dbgs() << "[" << Range.Offset << "-" << Range.Offset + Range.Size
-        << "] : " << AccIndex.size() << "\n");
+                        << "] : " << AccIndex.size() << "\n");
       int64_t DepItr = Range.Offset/StructSize;
       int64_t ElemItr = (Range.Offset%StructSize)/StructAlign;
       LLVM_DEBUG(dbgs() << "Size: "<< TI->DepInfo.size()<<" [" << DepItr << "-" << ElemItr << "]\n");
@@ -5255,10 +5255,6 @@ struct AATaskInfoCallSite : AATaskInfo {
         LLVM_DEBUG(dbgs() << "     - " << Acc.getKind() << " - " << *Acc.getLocalInst() << "\n");
         /// Store instruction
         if(Acc.getKind() == AAPointerInfo::AccessKind::AK_MUST_WRITE) {
-          if (Acc.getLocalInst() != Acc.getRemoteInst())
-            LLVM_DEBUG(dbgs() << "     -->                         " << *Acc.getRemoteInst()
-              << "\n");
-
           if(Acc.isWrittenValueYetUndetermined()) {
             LLVM_DEBUG(dbgs() << "       - c: Value written is not known yet \n");
             return false;
@@ -5267,14 +5263,51 @@ struct AATaskInfoCallSite : AATaskInfo {
             LLVM_DEBUG(dbgs() << "       - c: " << *Acc.getWrittenValue() << "\n");
             auto &Dep = TI->DepInfo[DepItr];
             if(auto *PtII = dyn_cast<PtrToIntInst>(Value)) {
-              if (ElemItr == 0) {
-                auto *BasePtr = PtII->getPointerOperand();
-                Dep.BasePtr = getUnderlyingObject(BasePtr);
-              }
-              else {
+              /// If the value is written in a different offset, give up
+              if (ElemItr != 0) {
                 LLVM_DEBUG(dbgs() << "PtrToIntInst not supported\n");
                 return false;
               }
+              /// Get the base pointer
+              auto *BasePtr = PtII->getPointerOperand();
+              /// If Base Ptr is an AllocInstruction, get the underlying object and continue
+              /// to next iteration
+              if (auto *AI = dyn_cast<AllocaInst>(BasePtr)) {
+                Dep.BasePtr = getUnderlyingObject(AI);
+                continue;
+              }
+              /// GEP Instruction
+              if (auto *GEP = dyn_cast<GetElementPtrInst>(BasePtr)) {
+                LLVM_DEBUG(dbgs() << "       - GEP: "<< *GEP <<"\n");
+                LLVM_DEBUG(dbgs() << "       - GEP num indices: "<< GEP->getNumIndices() <<"\n");
+                LLVM_DEBUG(dbgs() << "       - GEP indices: ");
+                /// Iterate through all indices
+                for (auto *IdxItr = GEP->idx_begin(); IdxItr != GEP->idx_end(); ++IdxItr) {
+                  auto *IdxVal = IdxItr->get();
+                  /// Get index value
+                  if (auto *IdxCI = dyn_cast<ConstantInt>(IdxVal)) {
+                    auto Idx = IdxCI->getSExtValue();
+                    LLVM_DEBUG(dbgs() << "       - Idx: "<< Idx <<"\n");
+                    continue;
+                  }
+                  else {
+                    LLVM_DEBUG(dbgs() << "       - Analyzing Idx: "<< *IdxVal <<"\n");
+                    /// Get offsets for the GEP
+                    auto &Idx = A.getAAFor<AATaskInfo>(
+                        *this, IRPosition::value(*IdxVal), DepClassTy::NONE);
+                    /// Check if the index is at fixpoint
+                    if(Idx.getState().isAtFixpoint()) {
+                      if(Idx.getState().isValidState())
+                        LLVM_DEBUG(dbgs() << "        -> Idx is at fix point - Optimistic fixpoint\n");
+                      else
+                        LLVM_DEBUG(dbgs() << "        -> Idx is at fix point - Pessimistic fixpoint\n");
+                    }
+                    else
+                      LLVM_DEBUG(dbgs() << "        -> Idx is not at fix point\n");
+                  }
+                }
+              }
+              else 
             }
             else if (auto *CI = dyn_cast<ConstantInt>(Value)) {
               auto ConstantVal = CI->getSExtValue();
@@ -5317,6 +5350,7 @@ struct AATaskInfoCallSite : AATaskInfo {
   }
 
   void initialize(Attributor &A) override {
+    LLVM_DEBUG(dbgs() << "[TaskInfo] Initialized\n");
     CallBase &TaskCallBase = cast<CallBase>(getAssociatedValue());
     Function *TaskFunction = getAssociatedFunction();
 
@@ -5349,8 +5383,7 @@ struct AATaskInfoCallSite : AATaskInfo {
     /// Get the pointer info
     auto &PI = A.getAAFor<AAPointerInfo>(
       *this, IRPosition::value(*TI->DepListAlloca), DepClassTy::NONE);
-    // LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] PI: " << &PI <<"\n");
-    if(!analyzePI(PI) && !isAtFixpoint()) {
+    if(!analyzePI(A, PI) && !isAtFixpoint()) {
       LLVM_DEBUG(dbgs() << "[TaskInfo][AAPointerInfo] Not at fixpoint. Recording dependence\n");
       /// Record dependence if we are not at fixpoint and the analysis failed
       A.recordDependence(PI, *this, DepClassTy::REQUIRED, true);
@@ -5359,7 +5392,7 @@ struct AATaskInfoCallSite : AATaskInfo {
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
-    LLVM_DEBUG(dbgs() << "[TaskInfo] updateImpl: " << this <<"\n");
+    LLVM_DEBUG(dbgs() << "[TaskInfo] updateImpl:\n");
 
     auto *triggeringAA = getTriggeringAA();
     /// If the pointer is not an instance of AAPointerInfo, we skip the rest of the function
@@ -5369,7 +5402,7 @@ struct AATaskInfoCallSite : AATaskInfo {
       return ChangeStatus::UNCHANGED;
     }
     auto *PI = dyn_cast<AAPointerInfo>(triggeringAA);
-    if(!analyzePI(*PI) && !isAtFixpoint()) {
+    if(!analyzePI(A, *PI) && !isAtFixpoint()) {
       /// Record dependence if we are not at fixpoint and the analysis failed
       A.recordDependence(*PI, *this, DepClassTy::REQUIRED);
       return ChangeStatus::UNCHANGED;
@@ -5395,6 +5428,78 @@ private:
   /// Task arguments
   const unsigned int DepNumArgNo = 3;
   const unsigned int DepListArgNo = 4;
+};
+
+/// AATaskInfoFloating
+struct AATaskInfoFloating : AATaskInfo {
+  AATaskInfoCallSite(const IRPosition &IRP, Attributor &A)
+      : AATaskInfo(IRP, A) {}
+
+  /// See AbstractAttribute::getAsStr()
+  const std::string getAsStr() const override {
+    if (!isValidState())
+      return "<invalid>";
+
+    std::string Str("AATaskInfoFloating: ");
+    return Str + std::string("OK");
+  }
+
+  void initialize(Attributor &A) override {
+    LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Initialized" << "\n");
+    auto &AnchorValue = getAnchorValue();
+    /// If anchor value is a int constant, indicate optimistic fixpoint
+    if (isa_and_nonnull<ConstantInt>(AnchorValue)) {
+      indicateOptimisticFixpoint();
+      return;
+    }
+    /// If anchor value is a GEP, iterate through the indices and start the process
+    /// again
+    // if(auto *GEP )
+    
+    /// For most of the examples with arrays, we first get the sext instruction
+    /// operand, and we work on it.
+    /// Is it a sext instruction?
+    auto *SI = dyn_cast<SExtInst>(&AnchorValue);
+    if (!SI) {
+      indicatePessimisticFixpoint();
+      return;
+    }
+
+    /// Get the underlying object
+    auto *UO = getUnderlyingObject(SI->getOperand(0));
+    /// Is it an allocainst?
+    if (auto *AI = dyn_cast<AllocaInst>(&UO)) {
+      /// Get the underlying object
+      // auto *UO = getUnderlyingObject(AI);
+      indicateOptimisticFixpoint();
+      return;
+    }
+    /// Is it a load instruction?
+    if (auto *LI = dyn_cast<LoadInst>(&UO)) {
+      /// Get the underlying object
+      // auto *UO = getUnderlyingObject(LI->getPointerOperand());
+      indicateOptimisticFixpoint();
+      return;
+    }
+    
+    LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Initialized finished" << "\n");
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    LLVM_DEBUG(dbgs() << "[TaskInfoFloating] updateImpl:\n");
+
+    LLVM_DEBUG(dbgs() << "[TaskInfoFloating] updateImpl finished" << "\n");
+    return ChangeStatus::CHANGED;
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Manifest\n");
+
+    return ChangeStatus::UNCHANGED;
+  }
+
+private:
+
 };
 
 /// TDG Info
@@ -5537,7 +5642,6 @@ struct AATDGInfoFunction : AATDGInfo {
   unsigned int BBCounter = 0;
   unsigned int CurrentBB = 0;
 };
-
 
 struct AATDGInfoFloating : AATDGInfo {
   AATDGInfoFloating(const IRPosition &IRP, Attributor &A)
@@ -6193,7 +6297,6 @@ AATaskInfo &AATaskInfo::createForPosition(const IRPosition &IRP,
   AATaskInfo *AA = nullptr;
   switch (IRP.getPositionKind()) {
     case IRPosition::IRP_INVALID:
-    case IRPosition::IRP_FLOAT:
     case IRPosition::IRP_ARGUMENT:
     case IRPosition::IRP_RETURNED:
     case IRPosition::IRP_FUNCTION:
@@ -6202,6 +6305,9 @@ AATaskInfo &AATaskInfo::createForPosition(const IRPosition &IRP,
       llvm_unreachable("TaskInfo can only be created for call site position!");
     case IRPosition::IRP_CALL_SITE_RETURNED:
       AA = new (A.Allocator) AATaskInfoCallSite(IRP, A);
+      break;
+    case IRPosition::IRP_FLOAT:
+      AA = new (A.Allocator) AATaskInfoFloating(IRP, A);
       break;
   }
     return *AA;

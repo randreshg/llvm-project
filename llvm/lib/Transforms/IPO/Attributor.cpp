@@ -2562,6 +2562,8 @@ ChangeStatus Attributor::updateAA(AbstractAttribute &AA) {
   if (!isAssumedDead(AA, nullptr, UsedAssumedInformation,
                      /* CheckBBLivenessOnly */ true))
       CS = AA.update(*this);
+  else
+    LLVM_DEBUG(dbgs() << "[Attributor] Update: " << AA.getName() << " -> Assumed dead\n");
     
 
   if (!AA.isQueryAA() && DV.empty() && !AA.getState().isAtFixpoint()) {
@@ -2582,6 +2584,8 @@ ChangeStatus Attributor::updateAA(AbstractAttribute &AA) {
 
   if (!AAState.isAtFixpoint())
     rememberDependences();
+  else
+    LLVM_DEBUG(dbgs() << "[Attributor] It is at fixpoint\n");
 
   // Verify the stack was used properly, that is we pop the dependence vector we
   // put there earlier.

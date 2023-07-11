@@ -1070,11 +1070,6 @@ struct AAPointerInfoImpl
       AA::RangeTy &Range) const override {
     HasBeenWrittenTo = false;
 
-    LLVM_DEBUG(dbgs() << "[AAPointerInfo] forallInterferingAccesses\n");
-    // LLVM_DEBUG("[AAPointerInfo] FindInterferingWrites: " <<
-    // (int)FindInterferingWrites << " FindInterferingReads: " <<
-    // (int)FindInterferingReads << "\n");
-
     SmallPtrSet<const Access *, 8> DominatingWrites;
     SmallVector<std::pair<const Access *, bool>, 8> InterferingAccesses;
 
@@ -1588,7 +1583,7 @@ ChangeStatus AAPointerInfoFloating::updateImpl(Attributor &A) {
         return false;
       }
     }
-    if (auto *GEP = dyn_cast<GEPOperator>(Usr)) {
+    if (auto *GEP = dyn_cast<GEPOperator>(Usr)) { 
       // Note the order here, the Usr access might change the map, CurPtr is
       // already in it though.
       auto &UsrOI = OffsetInfoMap[Usr];

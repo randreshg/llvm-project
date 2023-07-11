@@ -1557,7 +1557,6 @@ struct Attributor {
         updateAA(*AAPtr);
       return *AAPtr;
     }
-
     // No matching attribute found, create one.
     // Use the static create method.
     auto &AA = AAType::createForPosition(IRP, *this);
@@ -1633,6 +1632,7 @@ struct Attributor {
                        DepClass);
     return AA;
   }
+
   template <typename AAType>
   const AAType &getOrCreateAAFor(const IRPosition &IRP) {
     return getOrCreateAAFor<AAType>(IRP, /* QueryingAA */ nullptr,
