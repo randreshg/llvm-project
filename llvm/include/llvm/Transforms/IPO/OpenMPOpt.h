@@ -38,7 +38,8 @@ typedef unsigned char uint8;
 
 /// Task dependency information
 typedef struct TaskDependInfo {
-  Value *BasePtr;               // Alloca instruction of the base pointer
+  Value *BasePtrUO;             // Underlying object of base pointer
+  Value *BasePtr;               // Base pointer
   size_t BaseLen;               // Size of the base pointer
   // Offset for array section
   // Size -> infinite...

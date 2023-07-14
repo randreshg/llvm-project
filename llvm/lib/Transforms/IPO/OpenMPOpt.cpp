@@ -1002,6 +1002,7 @@ struct OpenMPOpt {
       for (auto Dep: TI.DepInfo) {
         LLVM_DEBUG(dbgs() << "  TaskDep \n");
         LLVM_DEBUG(dbgs() << "    BasePtr: " << *Dep.BasePtr << "\n");
+        LLVM_DEBUG(dbgs() << "    BasePtrUO: " << *Dep.BasePtrUO << "\n");
         LLVM_DEBUG(dbgs() << "    BaseLen: " << Dep.BaseLen << "\n");
         LLVM_DEBUG(dbgs() << "    Depend: " << (uint) Dep.Flag << "->");
         if(Dep.Flags.in == 1)
@@ -5231,7 +5232,7 @@ struct AATaskInfoFloating : AATaskInfo {
 
   void initialize(Attributor &A) override {
     auto &AnchorValue = getAnchorValue();
-    LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Initialized with: " << AnchorValue << "\n");
+    LLVM_DEBUG(dbgs() << "\n\n[TaskInfoFloating] Initialized with: " << AnchorValue << "\n");
     /// If AllocInstruction, get the underlying object and indicate optimistic fixpoint
     if (auto *AI = dyn_cast<AllocaInst>(&AnchorValue)) {
       auto *UO = getUnderlyingObject(AI);
@@ -5254,8 +5255,27 @@ struct AATaskInfoFloating : AATaskInfo {
     if (auto *LI = dyn_cast<LoadInst>(&AnchorValue)) {
       auto *UO = getUnderlyingObject(LI->getPointerOperand());
       LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Anchor value is a load instruction. Its UO is: "<< *UO << "\n");
-      Values.push_back(UO);
-      indicateOptimisticFixpoint();
+      if(LI->getPointerOperand() == UO) {
+        LLVM_DEBUG(dbgs() << "[TaskInfoFloating] - UO is the same as the load instruction\n");
+        Values.push_back(UO);
+        indicateOptimisticFixpoint();
+        return;
+      }
+      LLVM_DEBUG(dbgs() << "[TaskInfoFloating] - Analyzing for: "<<*LI->getPointerOperand()<<"\n");
+      /// Get value for index
+      auto &LIAA = A.getOrCreateAAFor<AATaskInfo>(
+          IRPosition::value(*LI->getPointerOperand()), *this, DepClassTy::NONE, false, false);
+      if(LIAA.getState().isValidState()) {
+          LLVM_DEBUG(dbgs() << "[TaskInfoFloating] LIAA is at fix point - Optimistic fixpoint\n");
+          /// Cast AATaskInfo to AATaskInfoFloating
+          auto *LIAAFloating = dyn_cast<AATaskInfoFloating>(&LIAA);
+          Values.append(LIAAFloating->Values);
+          indicateOptimisticFixpoint();
+      }
+      else {
+        LLVM_DEBUG(dbgs() << "[TaskInfoFloating] IdxAA is not at fix point - Pessimistic fixpoint\n");
+        indicatePessimisticFixpoint();
+      }
       return;
     }
 
@@ -5289,16 +5309,28 @@ struct AATaskInfoFloating : AATaskInfo {
     }
 
     /// Is it a sext instruction?
-    auto *SI = dyn_cast<SExtInst>(&AnchorValue);
-    if (!SI) {
-      LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Anchor value is not a sext instruction\n");
-      indicatePessimisticFixpoint();
+    if(auto *SI = dyn_cast<SExtInst>(&AnchorValue)) {
+      auto *UO = SI->getOperand(0);
+      LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Anchor value is a sext instruction Its UO is: "<< *UO << "\n");
+      /// Get value for index
+      auto &SIAA = A.getOrCreateAAFor<AATaskInfo>(
+          IRPosition::value(*UO), *this, DepClassTy::NONE, false, false);
+      if(SIAA.getState().isValidState()) {
+          LLVM_DEBUG(dbgs() << "[TaskInfoFloating] IdxAA is at fix point - Optimistic fixpoint\n");
+          /// Cast AATaskInfo to AATaskInfoFloating
+          auto *SIAAFloating = dyn_cast<AATaskInfoFloating>(&SIAA);
+          Values.append(SIAAFloating->Values);
+          indicateOptimisticFixpoint();
+      }
+      else {
+        LLVM_DEBUG(dbgs() << "[TaskInfoFloating] IdxAA is not at fix point - Pessimistic fixpoint\n");
+        indicatePessimisticFixpoint();
+      }
       return;
     }
 
-    /// If we reach this point, it is because we are working with arrays.
-    // auto *SIOperand = SI->getOperand(0);
-    auto *BO = dyn_cast<BinaryOperator>(SI->getOperand(0));
+    /// Binary operator?
+    auto *BO = dyn_cast<BinaryOperator>(&AnchorValue);
     if(!BO) {
       LLVM_DEBUG(dbgs() << "[TaskInfoFloating] Instruction is not a binary operation.\n");
       indicatePessimisticFixpoint();
@@ -5396,22 +5428,25 @@ struct AATaskInfoCallSite : AATaskInfo {
                 LLVM_DEBUG(dbgs() << "PtrToIntInst not supported\n");
                 return false;
               }
-              /// Get the base pointer
-              auto *BasePtr = PtII->getPointerOperand();
+              Dep.BasePtr = PtII->getPointerOperand();
+              Dep.BasePtrUO = getUnderlyingObject(Dep.BasePtr);
+              LLVM_DEBUG(dbgs() << "       - BasePtr: "  <<*Dep.BasePtr<<"\n");
+              if(Dep.BasePtr != Dep.BasePtrUO)
+                LLVM_DEBUG(dbgs() << "       - BasePtrUO: "<<*Dep.BasePtrUO<<"\n");
               /// Get value of the base pointer
-              auto &ValueAA = A.getOrCreateAAFor<AATaskInfo>(
-                IRPosition::value(*BasePtr), *this, DepClassTy::NONE, false, false);
-              if(!ValueAA.getState().isValidState()) {
-                LLVM_DEBUG(dbgs() << "[TaskInfo][AnalizePI] ValueAA is invalid\n");
-                indicatePessimisticFixpoint();
-                return false;
-              }
-              /// Cast ValueAA to AATaskInfoFloating
-              auto *ValueAATaskInfo = dyn_cast<AATaskInfoFloating>(&ValueAA);
-              /// Debug values
-              for(auto *V : ValueAATaskInfo->Values) {
-                LLVM_DEBUG(dbgs() << "       - Value: "<<*V<<"\n");
-              }
+              // auto &ValueAA = A.getOrCreateAAFor<AATaskInfo>(
+              //   IRPosition::value(*BasePtr), *this, DepClassTy::NONE, false, false);
+              // if(!ValueAA.getState().isValidState()) {
+              //   LLVM_DEBUG(dbgs() << "[TaskInfo][AnalizePI] ValueAA is invalid\n");
+              //   indicatePessimisticFixpoint();
+              //   return false;
+              // }
+              // /// Cast ValueAA to AATaskInfoFloating
+              // auto *ValueAATaskInfo = dyn_cast<AATaskInfoFloating>(&ValueAA);
+              // /// Debug values
+              // for(auto *V : ValueAATaskInfo->Values) {
+              //   LLVM_DEBUG(dbgs() << "       - Value: "<<*V<<"\n");
+              // }
               
             }
             else if (auto *CI = dyn_cast<ConstantInt>(Value)) {
@@ -5992,7 +6027,11 @@ bool TaskDependencyGraph::addTask(TaskInfo &TaskFound) {
     LLVM_DEBUG(dbgs() << "[TDG] Checking dependencies\n");
     for (auto &DepInfo : Task.DepInfo) {
       for (auto &DepFound : TaskFound.DepInfo) {
+        /// Check if the dependence is on the same memory location
         if (DepInfo.BasePtr == DepFound.BasePtr) {
+          /// Check if BasePtrUo is the same
+          if (DepInfo.BasePtrUO != DepFound.BasePtrUO)
+            continue;
           /// Make sure we wont add the same dependence twice
           Task.addSuccessor(TaskFound.ID);
           TaskFound.addPredecessor(Task.ID);
