@@ -4610,6 +4610,8 @@ void CodeGenFunction::EmitOMPTaskBasedDirective(
     const OMPExecutableDirective &S, const OpenMPDirectiveKind CapturedRegion,
     const RegionCodeGenTy &BodyGen, const TaskGenTy &TaskGen,
     OMPTaskDataTy &Data) {
+  // Print debug info.
+  printf("\nTASKDEBUG ------ EmitOMPTaskBasedDirective\n");
   // Emit outlined function for task construct.
   const CapturedStmt *CS = S.getCapturedStmt(CapturedRegion);
   auto I = CS->getCapturedDecl()->param_begin();
@@ -4643,6 +4645,8 @@ void CodeGenFunction::EmitOMPTaskBasedDirective(
   llvm::DenseSet<const VarDecl *> EmittedAsPrivate;
   // Get list of private variables.
   for (const auto *C : S.getClausesOfKind<OMPPrivateClause>()) {
+    static int count = 0;
+    printf("TASKDEBUG - OMPPrivateClause: %d\n", count++);
     auto IRef = C->varlist_begin();
     for (const Expr *IInit : C->private_copies()) {
       const auto *OrigVD = cast<VarDecl>(cast<DeclRefExpr>(*IRef)->getDecl());
@@ -4656,6 +4660,8 @@ void CodeGenFunction::EmitOMPTaskBasedDirective(
   EmittedAsPrivate.clear();
   // Get list of firstprivate variables.
   for (const auto *C : S.getClausesOfKind<OMPFirstprivateClause>()) {
+    static int count = 0;
+    printf("TASKDEBUG - OMPFirstprivateClause: %d\n", count++);
     auto IRef = C->varlist_begin();
     auto IElemInitRef = C->inits().begin();
     for (const Expr *IInit : C->private_copies()) {
@@ -4704,14 +4710,19 @@ void CodeGenFunction::EmitOMPTaskBasedDirective(
   buildDependences(S, Data);
   // Get list of local vars for untied tasks.
   if (!Data.Tied) {
+    printf("TASKDEBUG - !Data.Tied\n");
     CheckVarsEscapingUntiedTaskDeclContext Checker;
     Checker.Visit(S.getInnermostCapturedStmt()->getCapturedStmt());
     Data.PrivateLocals.append(Checker.getPrivateDecls().begin(),
                               Checker.getPrivateDecls().end());
+    printf("TASKDEBUG - Data.PrivateLocals.size(): %d\n", Data.PrivateLocals.size());
   }
+  else 
+    printf("TASKDEBUG - Data.Tied\n");
   auto &&CodeGen = [&Data, &S, CS, &BodyGen, &LastprivateDstsOrigs,
                     CapturedRegion](CodeGenFunction &CGF,
                                     PrePostActionTy &Action) {
+    printf("TASKDEBUG - CodeGen\n");
     llvm::MapVector<CanonicalDeclPtr<const VarDecl>,
                     std::pair<Address, Address>>
         UntiedLocalVars;
@@ -4768,6 +4779,7 @@ void CodeGenFunction::EmitOMPTaskBasedDirective(
     llvm::SmallVector<std::pair<const VarDecl *, Address>, 16> FirstprivatePtrs;
     if (!Data.PrivateVars.empty() || !Data.FirstprivateVars.empty() ||
         !Data.LastprivateVars.empty() || !Data.PrivateLocals.empty()) {
+      printf("TASKDEBUG - It has clauses\n");
       enum { PrivatesParam = 2, CopyFnParam = 3 };
       llvm::Value *CopyFn = CGF.Builder.CreateLoad(
           CGF.GetAddrOfLocalVar(CS->getCapturedDecl()->getParam(CopyFnParam)));
@@ -4873,6 +4885,8 @@ void CodeGenFunction::EmitOMPTaskBasedDirective(
         }
       }
     }
+    else
+      printf("TASKDEBUG - No clauses\n");
     if (Data.Reductions) {
       OMPPrivateScope FirstprivateScope(CGF);
       for (const auto &Pair : FirstprivatePtrs) {
@@ -5239,9 +5253,10 @@ void CodeGenFunction::processInReduction(const OMPExecutableDirective &S,
 }
 
 void CodeGenFunction::EmitOMPTaskDirective(const OMPTaskDirective &S) {
+  printf("TASKDEBUG - EmitOMPTaskDirective\n");
   // Emit outlined function for task construct.
   const CapturedStmt *CS = S.getCapturedStmt(OMPD_task);
-  Address CapturedStruct = GenerateCapturedStmtArgument(*CS);
+  Address CapturedStruct = GenerateCapture:dStmtArgument(*CS);
   QualType SharedsTy = getContext().getRecordType(CS->getCapturedRecordDecl());
   const Expr *IfCond = nullptr;
   for (const auto *C : S.getClausesOfKind<OMPIfClause>()) {

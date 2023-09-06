@@ -1295,6 +1295,7 @@ llvm::Function *CGOpenMPRuntime::emitTaskOutlinedFunction(
     const VarDecl *PartIDVar, const VarDecl *TaskTVar,
     OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen,
     bool Tied, unsigned &NumberOfParts) {
+  printf("TASKDEBUG - emitTaskOutlinedFunction\n");
   auto &&UntiedCodeGen = [this, &D, TaskTVar](CodeGenFunction &CGF,
                                               PrePostActionTy &) {
     llvm::Value *ThreadID = getThreadID(CGF, D.getBeginLoc());
@@ -3814,6 +3815,7 @@ CGOpenMPRuntime::emitTaskInit(CodeGenFunction &CGF, SourceLocation Loc,
                               const OMPExecutableDirective &D,
                               llvm::Function *TaskFunction, QualType SharedsTy,
                               Address Shareds, const OMPTaskDataTy &Data) {
+  printf("TASKDEBUG - emitTaskInit\n");
   ASTContext &C = CGM.getContext();
   llvm::SmallVector<PrivateDataTy, 4> Privates;
   // Aggregate privates and sort them by the alignment.
@@ -4714,6 +4716,7 @@ void CGOpenMPRuntime::emitTaskCall(CodeGenFunction &CGF, SourceLocation Loc,
   if (!CGF.HaveInsertPoint())
     return;
 
+  printf("TASKDEBUG - emitTaskCall\n");
   TaskResultTy Result =
       emitTaskInit(CGF, Loc, D, TaskFunction, SharedsTy, Shareds, Data);
   llvm::Value *NewTask = Result.NewTask;
