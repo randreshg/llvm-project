@@ -20,6 +20,7 @@ add_llvm_component_library(LLVMPasses
   Core
   Coroutines
   IPO
+  ARTS
   InstCombine
   IRPrinter
   ObjCARC

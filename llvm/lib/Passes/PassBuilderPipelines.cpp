@@ -132,6 +132,7 @@
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include "llvm/Transforms/Vectorize/VectorCombine.h"
+#include "llvm/Transforms/ARTS/ARTSTransform.h"
 
 using namespace llvm;
 
@@ -1050,6 +1051,9 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   // Try to perform OpenMP specific optimizations on the module. This is a
   // (quick!) no-op if there are no OpenMP runtime calls present in the module.
   MPM.addPass(OpenMPOptPass());
+
+  // Run ARTSTransformPass after OpenMPOptPass
+  MPM.addPass(ARTSTransformPass());
 
   if (AttributorRun & AttributorRunOption::MODULE)
     MPM.addPass(AttributorPass());
