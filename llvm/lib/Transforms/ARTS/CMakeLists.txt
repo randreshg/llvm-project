@@ -30,4 +30,5 @@ add_llvm_component_library(LLVMarts
   TransformUtils
   Vectorize
   Instrumentation
+  IPO
   )
