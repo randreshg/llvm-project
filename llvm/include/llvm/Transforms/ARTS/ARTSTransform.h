@@ -10,8 +10,10 @@ enum RTFunction {
   OTHER = 0,
   PARALLEL,
   PARALLEL_FOR,
+  TASKALLOC,
   TASK,
   TASKWAIT,
+  TASKDEP,
   SET_NUM_THREADS
 };
 

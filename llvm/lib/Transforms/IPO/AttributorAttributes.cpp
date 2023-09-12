@@ -901,7 +901,7 @@ protected:
   SmallVector<AAPointerInfo::Access> AccessList;
   OffsetBinsTy OffsetBins;
   DenseMap<const Instruction *, SmallVector<unsigned>> RemoteIMap;
-
+  
   /// See AAPointerInfo::forallInterferingAccesses.
   bool forallInterferingAccesses(
       AA::RangeTy Range,
@@ -1101,6 +1101,24 @@ struct AAPointerInfoImpl
   /// See AbstractAttribute::manifest(...).
   ChangeStatus manifest(Attributor &A) override {
     return AAPointerInfo::manifest(A);
+  }
+
+  const AAPointerInfo::Access &getAccess(unsigned Index) const override {
+    return State::getAccess(Index);
+  }
+
+  unsigned getOffsetBinsSize() const override { return OffsetBins.size(); }
+  
+  bool forallOffsetBins(
+    function_ref<bool(const AA::RangeTy&, const SmallSet<unsigned, 4>&)> CB)
+    const override {
+    for (auto &It : OffsetBins) {
+      const AA::RangeTy& key = It.first;
+      const SmallSet<unsigned, 4>& value = It.second;
+      if (!CB(key, value))
+        return false;
+    }
+    return true;
   }
 
   bool forallInterferingAccesses(
@@ -1373,7 +1391,6 @@ struct AAPointerInfoImpl
     using namespace AA::PointerInfo;
     if (!OtherAA.getState().isValidState() || !isValidState())
       return indicatePessimisticFixpoint();
-
     const auto &OtherAAImpl = static_cast<const AAPointerInfoImpl &>(OtherAA);
     bool IsByval = OtherAAImpl.getAssociatedArgument()->hasByValAttr();
 

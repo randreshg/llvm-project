@@ -101,6 +101,7 @@
 #include "llvm/ADT/GraphTraits.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/iterator.h"
@@ -6111,6 +6112,18 @@ struct AAPointerInfo : public AbstractAttribute {
 
   /// See AbstractAttribute::getIdAddr()
   const char *getIdAddr() const override { return &ID; }
+
+  /// Get access
+  virtual const Access &getAccess(unsigned Index) const = 0;
+
+  /// Get offset bins size
+  virtual unsigned getOffsetBinsSize() const = 0;
+
+  /// Call \p CB on each of the offsetbins and returns true if the callback
+  /// returned true for all of them, false otherwise.
+  virtual bool forallOffsetBins(
+      function_ref<bool(const AA::RangeTy&, 
+                        const SmallSet<unsigned, 4>&)> CB) const = 0;
 
   /// Call \p CB on all accesses that might interfere with \p Range and return
   /// true if all such accesses were known and the callback returned true for

@@ -45,7 +45,11 @@ RTFunction getRTFunction(Function *F) {
   if(calleeName == "__kmpc_fork_call")
     return RTFunction::PARALLEL;
   else if(calleeName == "__kmpc_omp_task_alloc")
+    return RTFunction::TASKALLOC;
+  else if(calleeName == "__kmpc_omp_task")
     return RTFunction::TASK;
+  else if(calleeName == "__kmpc_omp_task_alloc_with_deps")
+    return RTFunction::TASKDEP;
   else if(calleeName == "__kmpc_omp_taskwait")
     return RTFunction::TASKWAIT;
   else if(calleeName == "omp_set_num_threads")
@@ -53,6 +57,13 @@ RTFunction getRTFunction(Function *F) {
   else if(calleeName == "__kmpc_for_static_init_4")
     return RTFunction::PARALLEL_FOR;
   return RTFunction::OTHER;
+}
+
+bool isTaskFunction(Function *F) {
+  auto RT = getRTFunction(F);
+  if(RT == RTFunction::TASK || RT == RTFunction::TASKDEP || RT == RTFunction::TASKWAIT )
+    return true;
+  return false;
 }
 
 ///// AADataEnvironment
@@ -103,7 +114,7 @@ struct AADataEnvFunction : AADataEnv {
 
   void initialize(Attributor &A) override {
     Function *F = getAnchorScope();
-    LLVM_DEBUG(dbgs() <<"\n[AADataEnvFunction] initialize: " << F->getName() << "\n");
+    LLVM_DEBUG(dbgs() <<"\n[AADataEnvFunction] initialize: " << F->getName() << "\n" << *F << "\n");
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
@@ -146,6 +157,166 @@ struct AADataEnvCallSite : AADataEnv {
     return Str + std::string("OK");
   }
 
+  void handleParallelRegion(CallBase &CB) {
+    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Parallel region - FOUND\n");
+    /// Get the number of arguments
+    unsigned int NumArgs = CB.data_operands_size();
+    // LLVM_DEBUG(dbgs() << "Number of arguments: " << NumArgs << "\n");
+    auto OutlinedRegion = CB.getArgOperand(2);
+    DE.F = dyn_cast<Function>(OutlinedRegion);
+
+    /// Get private and shared variables
+    for(unsigned int i = 3; i < NumArgs; i++) {
+      Value *Arg = CB.getArgOperand(i);
+      Type *ArgType = Arg->getType();
+      // LLVM_DEBUG(dbgs() << "Argument: " << *Arg << "\n");
+      // LLVM_DEBUG(dbgs() << "Argument type: " << *ArgType << "\n");
+
+      /// For now assume that if it is a pointer, it is a shared variable
+
+      if(PointerType *PT = dyn_cast<PointerType>(ArgType))
+        DE.SharedVars.push_back(Arg);
+      /// If not, it is a first private variable
+      else
+        DE.FirstprivateVars.push_back(Arg);
+
+      /// NOTES: The outline function or the variable should have attributes that 
+      /// provide more information about the lifetime of the variable. 
+      /// It is also important to consider the underlying type of the variable.
+      /// There may be cases, where there is a firstprivate variable that is a pointer.
+      /// For this case, the pointer is private, but the data it points to is shared.
+
+      /// Do we need to consider private variables?
+    }
+    /// Run AA on the outline function
+    auto *DEF = A.getAAFor<AADataEnv>(
+      *this, IRPosition::function(*DE.F), DepClassTy::NONE);
+    if (!DEF->getState().isValidState()) {
+      indicatePessimisticFixpoint();
+      LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] DEF is invalid\n");
+      return;
+    }
+    /// TODO: Check if it is a fixpoint, if so, append the data environment
+    /// of the outline function. Otherwise, record 
+
+    }
+  }
+
+  void handleTaskRegion(CallBase &CB) {
+    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Task alloc - FOUND\n");
+    DE.RTF = RTF;
+    // LLVM_DEBUG(dbgs() << "Returned value: " << CB << "\n");
+    // LLVM_DEBUG(dbgs() << "--Uses:\n");
+    /// Check all uses of the returned value
+    for(auto &U : CB.uses()) {
+      auto *User = U.getUser();
+      // LLVM_DEBUG(dbgs() << "--- " << *U << "\n");
+      // LLVM_DEBUG(dbgs() << "------ " << *User << "\n");
+      // LLVM_DEBUG(dbgs() << "------ " << *(U.get()) << "\n");
+      /// ISA call instrution
+      if(auto *CBI = dyn_cast<CallInst>(User)) {
+        auto *Callee = CBI->getCalledFunction();
+        if(isTaskFunction(Callee)) {
+          /// Add the attribute nocapture to the returned value
+          CBI->addParamAttr(U.getOperandNo(), Attribute::NoCapture);
+        }
+      }
+    }
+    /// Run AAPointerInfo on the returned value
+    auto *PI = A.getAAFor<AAPointerInfo>(
+      *this, IRPosition::callsite_returned(CB), DepClassTy::NONE);
+    if (!PI->getState().isValidState()) {
+      indicatePessimisticFixpoint();
+      LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] AAPointerInfo is invalid\n");
+      return;
+    }
+    /// Is it a fixpoint?
+    if (!PI->getState().isAtFixpoint()) {
+      indicateOptimisticFixpoint();
+      LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] AAPointerInfo is at fixpoint\n");
+      return;
+    }
+    else 
+      LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] AAPointerInfo is not at fixpoint\n"); 
+    /// We also need to check whether the PI is at fixed point or not.
+    /// For now we ignore it.
+    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] AAPointerInfo is valid with: "
+                      << PI->getOffsetBinsSize() << " bins\n");
+
+    auto dumpStateCB = [&](const AA::RangeTy &Range,
+                        const SmallSet<unsigned, 4> &AccIndex) {
+      LLVM_DEBUG(dbgs()
+                  << "[" << Range.Offset << "-" << Range.Offset + Range.Size
+                  << "] : " << AccIndex.size() << "\n");
+      for (auto AI : AccIndex) {
+        LLVM_DEBUG(dbgs() << "     - " << PI->getAccess(AI).getKind()
+                          << " - " << *PI->getAccess(AI).getLocalInst()
+                          << "\n");
+      }
+      return true;
+    };
+    /// This CB checks the access of the returned value. If it is a store
+    /// instruction...
+    auto accessCB = [&](const AA::RangeTy &Range,
+                        const SmallSet<unsigned, 4> &AccIndex) {
+      LLVM_DEBUG(dbgs()
+                  << "[" << Range.Offset << "-" << Range.Offset + Range.Size
+                  << "] : " << AccIndex.size() << "\n");
+      for (auto AI : AccIndex) {
+        auto &Acc = PI->getAccess(AI);
+        auto AccKind = Acc.getKind();
+        auto *Inst = Acc.getLocalInst();
+        LLVM_DEBUG(dbgs() << "     - " << AccKind << " - " << *Inst << "\n");
+
+        if (Acc.isWrittenValueYetUndetermined()) {
+          LLVM_DEBUG(dbgs()
+                      << "       - c: Value written is not known yet \n");
+          return false;
+        }
+        /// Write instruction
+        if (AccKind == AAPointerInfo::AccessKind::AK_MUST_WRITE) {
+          LLVM_DEBUG(dbgs() << "       -- Store instruction\n");
+          Value *value = Acc.getWrittenValue();
+          if(!value)
+            continue;
+
+          if (auto *PtII = dyn_cast<PtrToIntInst>(value)) {
+            LLVM_DEBUG(dbgs() << "       - PtrToIntInst\n");
+          }
+          else if (auto *CI = dyn_cast<ConstantInt>(value)) {
+            auto ConstantVal = CI->getSExtValue();
+            LLVM_DEBUG(dbgs() << "       - c: value " << ConstantVal << "\n");
+          }
+          else if (isa_and_nonnull<Function>(value)) {
+            LLVM_DEBUG(dbgs() << "       - c: func "
+                              << value->getName() << "\n");
+          }
+          else {
+            LLVM_DEBUG(dbgs() << "       - c: other " << *value << "\n");
+          } 
+        }
+        /// Read instruction
+        else if(AccKind == AAPointerInfo::AccessKind::AK_MUST_READ) {
+          LLVM_DEBUG(dbgs() << "       -- Read instruction\n");
+          /// Check if it a load instruction
+          if(auto *LI = dyn_cast<LoadInst>(Inst)) {
+            LLVM_DEBUG(dbgs() << "       - Load instruction\n");
+          }
+          
+          // LLVM_DEBUG(dbgs() << "       - c: other " << *value << "\n");
+        }
+      }
+      return true;
+    };
+    /// For all ofset bins in the PI, run the accessCB
+    if(!PI->forallOffsetBins(accessCB)) {
+      LLVM_DEBUG(dbgs() << "PI forallOffsetBins failed\n");
+      indicatePessimisticFixpoint();
+      return;
+    }
+    indicateOptimisticFixpoint();
+  }
+
   void initialize(Attributor &A) override {
     CallBase &CB = cast<CallBase>(getAssociatedValue());
     Function *Callee = getAssociatedFunction();
@@ -160,67 +331,11 @@ struct AADataEnvCallSite : AADataEnv {
         }
       }
       break;
-      case PARALLEL: {
-        LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Parallel for - FOUND\n");
-        DE.RTF = RTF;
-        /// Get the number of arguments
-        unsigned int NumArgs = CB.data_operands_size();
-        // LLVM_DEBUG(dbgs() << "Number of arguments: " << NumArgs << "\n");
-        auto OutlinedRegion = CB.getArgOperand(2);
-        DE.F = dyn_cast<Function>(OutlinedRegion);
-
-        /// Get private and shared variables
-        for(unsigned int i = 3; i < NumArgs; i++) {
-          Value *Arg = CB.getArgOperand(i);
-          Type *ArgType = Arg->getType();
-          // LLVM_DEBUG(dbgs() << "Argument: " << *Arg << "\n");
-          // LLVM_DEBUG(dbgs() << "Argument type: " << *ArgType << "\n");
-
-          /// For now assume that if it is a pointer, it is a shared variable
-
-          if(PointerType *PT = dyn_cast<PointerType>(ArgType))
-            DE.SharedVars.push_back(Arg);
-          /// If not, it is a first private variable
-          else
-            DE.FirstprivateVars.push_back(Arg);
-
-          /// NOTES: The outline function or the variable should have attributes that 
-          /// provide more information about the lifetime of the variable. 
-          /// It is also important to consider the underlying type of the variable.
-          /// There may be cases, where there is a firstprivate variable that is a pointer.
-          /// For this case, the pointer is private, but the data it points to is shared.
-
-          /// Do we need to consider private variables?
-        }
-        /// Analyze outline function
-        auto *DEF = A.getAAFor<AADataEnv>(
-          *this, IRPosition::function(*DE.F), DepClassTy::NONE);
-        if (!DEF->getState().isValidState()) {
-          indicatePessimisticFixpoint();
-          LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] DEF is invalid\n");
-        }
-        else {
-          /// Append the data environment of the outline function
-
-        }
-        /// For now, indicate optimistic fixpoint
-        // indicateOptimisticFixpoint();
-      }
+      case PARALLEL:
+        handleParallelRegion(CB);
       break;
-      case TASK: {
-        LLVM_DEBUG(dbgs() << "Task - FOUND\n");
-        DE.RTF = RTF;
-        /// Get returned value
-        // Value *Ret = CB.getArgOperand(0);
-        LLVM_DEBUG(dbgs() << "Returned value: " << CB << "\n");
-        LLVM_DEBUG(dbgs() << "--Users:\n");
-        /// Check all uses of the returned value
-        for(auto *U : CB.users()) {
-          /// If the use is a store instruction, then the variable is private
-          LLVM_DEBUG(dbgs() << *U << "\n");
-        }
-
-      }
+      case TASKALLOC:
+        handleTaskRegion(CB);
       break;
       case OTHER: {
         LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Other instruction - FOUND\n");
@@ -231,7 +346,7 @@ struct AADataEnvCallSite : AADataEnv {
         return;
       }
       /// If the callee is known and can be used in IPO. Run AA on the callee.
-      LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] Doing IPO for function.\n");
+      LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] Doing IPA for function.\n");
       auto *DEF = A.getAAFor<AADataEnv>(
           *this, IRPosition::function(*Callee), DepClassTy::NONE);
       // A.recordDependence(TDGInfoCS, *this, DepClassTy::REQUIRED, true);
@@ -298,7 +413,7 @@ bool ARTSTransform::run() {
     LLVM_DEBUG(dbgs() << TAG << "Main function not found\n");
     return changed;
   }
-  LLVM_DEBUG(dbgs() << *MainFunction << "\n");
+  // LLVM_DEBUG(dbgs() << *MainFunction << "\n");
   A.getOrCreateAAFor<AADataEnv>(
           IRPosition::function(*MainFunction), /* QueryingAA */ nullptr,
           DepClassTy::NONE, /* ForceUpdate */ false,
