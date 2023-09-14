@@ -6122,8 +6122,9 @@ struct AAPointerInfo : public AbstractAttribute {
   /// Call \p CB on each of the offsetbins and returns true if the callback
   /// returned true for all of them, false otherwise.
   virtual bool forallOffsetBins(
-      function_ref<bool(const AA::RangeTy&, 
-                        const SmallSet<unsigned, 4>&)> CB) const = 0;
+      std::function<bool(const AA::RangeTy&, 
+                    const SmallSet<unsigned, 4>&,
+                    const AAPointerInfo *)> CB) const = 0;
 
   /// Call \p CB on all accesses that might interfere with \p Range and return
   /// true if all such accesses were known and the callback returned true for

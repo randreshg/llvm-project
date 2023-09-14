@@ -1804,7 +1804,10 @@ bool Attributor::checkForAllUses(
     }
 
     if (auto *SI = dyn_cast<StoreInst>(U->getUser())) {
+      LLVM_DEBUG(dbgs() << "[Attributor] Store use: " << **U << " in "
+                        << *U->getUser() << "\n");
       if (&SI->getOperandUse(0) == U) {
+        LLVM_DEBUG(dbgs() << "[Attributor] Store is on the pointer operand\n");
         if (!Visited.insert(U).second)
           continue;
         SmallSetVector<Value *, 4> PotentialCopies;

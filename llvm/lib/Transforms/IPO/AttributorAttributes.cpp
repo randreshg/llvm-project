@@ -1110,12 +1110,13 @@ struct AAPointerInfoImpl
   unsigned getOffsetBinsSize() const override { return OffsetBins.size(); }
   
   bool forallOffsetBins(
-    function_ref<bool(const AA::RangeTy&, const SmallSet<unsigned, 4>&)> CB)
+    std::function<bool(const AA::RangeTy&, const SmallSet<unsigned, 4>&,
+                       const AAPointerInfo *)> CB)
     const override {
     for (auto &It : OffsetBins) {
       const AA::RangeTy& key = It.first;
       const SmallSet<unsigned, 4>& value = It.second;
-      if (!CB(key, value))
+      if (!CB(key, value, this))
         return false;
     }
     return true;
@@ -1502,6 +1503,7 @@ struct AAPointerInfoFloating : public AAPointerInfoImpl {
         !Content.value_or(nullptr) || !isa<Constant>(*Content) ||
         (*Content)->getType() != VT ||
         DL.getTypeStoreSize(VT->getElementType()).isScalable()) {
+      LLVM_DEBUG(dbgs() << "[AAPointerInfo] Adding access " << I << "\n");
       Changed = Changed | addAccess(A, {Offsets, Size}, I, Content, Kind, &Ty);
     } else {
       // Handle vector stores with constant content element-wise.
@@ -1613,6 +1615,7 @@ bool AAPointerInfoFloating::collectConstantsForGEP(Attributor &A,
 
 ChangeStatus AAPointerInfoFloating::updateImpl(Attributor &A) {
   using namespace AA::PointerInfo;
+  LLVM_DEBUG(dbgs() << "[AAPointerInfo] AAPointerInfoFloating::updateImpl\n");
   ChangeStatus Changed = ChangeStatus::UNCHANGED;
   const DataLayout &DL = A.getDataLayout();
   Value &AssociatedValue = getAssociatedValue();
@@ -1760,6 +1763,7 @@ ChangeStatus AAPointerInfoFloating::updateImpl(Attributor &A) {
     }
 
     if (auto *LoadI = dyn_cast<LoadInst>(Usr)) {
+      LLVM_DEBUG(dbgs() << "[AAPointerInfo] AAPointerInfoFloating::Load instruction\n");
       // If the access is to a pointer that may or may not be the associated
       // value, e.g. due to a PHI, we cannot assume it will be read.
       AccessKind AK = AccessKind::AK_R;
@@ -1885,10 +1889,12 @@ ChangeStatus AAPointerInfoFloating::updateImpl(Attributor &A) {
                           Changed, ValueTy);
     };
 
-    if (auto *StoreI = dyn_cast<StoreInst>(Usr))
+    if (auto *StoreI = dyn_cast<StoreInst>(Usr)) {
+      LLVM_DEBUG(dbgs() << "[AAPointerInfo] AAPointerInfoFloating::Store instruction with "<< *Usr <<"\n");
       return HandleStoreLike(*StoreI, StoreI->getValueOperand(),
                              *StoreI->getValueOperand()->getType(),
                              {StoreI->getValueOperand()}, AccessKind::AK_W);
+    }
     if (auto *RMWI = dyn_cast<AtomicRMWInst>(Usr))
       return HandleStoreLike(*RMWI, nullptr, *RMWI->getValOperand()->getType(),
                              {RMWI->getValOperand()}, AccessKind::AK_RW);
