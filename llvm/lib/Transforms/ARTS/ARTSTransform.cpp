@@ -1,19 +1,10 @@
-//===- TaskDependencyGraph.cpp - Generation of a static OpenMP task dependency
-// graph
-//--------------------===//
-//
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-// Generates an static OpenMP task dependency graph.
-//===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/ARTS/ARTSTransform.h"
+#include "llvm/Frontend/ARTS/ARTSIRBuilder.h"
 
 #include "llvm/Support/Debug.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 using namespace llvm;
 
@@ -66,7 +57,90 @@ bool isTaskFunction(Function *F) {
   return false;
 }
 
-///// AADataEnvironment
+/// AAToARTS
+/// This AbstractAttribute analyzes a given function and tries to determine
+/// if it can be transformed to ARTS. 
+struct AAToARTS : public StateWrapper<BooleanState, AbstractAttribute> {
+  using Base = StateWrapper<BooleanState, AbstractAttribute>;
+
+  AAToARTS(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
+
+  /// Statistics are tracked as part of manifest for now.
+  void trackStatistics() const override {}
+
+  static AAToARTS &createForPosition(const IRPosition &IRP,
+                                           Attributor &A);
+
+  /// See AbstractAttribute::getName()
+  const std::string getName() const override { return "AAToARTS"; }
+
+  /// See AbstractAttribute::getIdAddr()
+  const char *getIdAddr() const override { return &ID; }
+
+  /// This function should return true if the type of the \p AA is
+  /// AAToARTS
+  static bool classof(const AbstractAttribute *AA) {
+    return (AA->getIdAddr() == &ID);
+  }
+
+  static const char ID;
+};
+
+struct AAToARTSFunction : AAToARTS {
+  AAToARTSFunction(const IRPosition &IRP, Attributor &A) : AAToARTS(IRP, A) {}
+
+  /// See AbstractAttribute::getAsStr(Attributor *A)
+  const std::string getAsStr(Attributor *A) const override {
+    if (!isValidState())
+      return "<invalid>";
+    std::string Str("AAToARTSFunction: ");
+    return Str + "OK";
+  }
+
+  void initialize(Attributor &A) override {
+    Function *F = getAnchorScope();
+    LLVM_DEBUG(dbgs() <<"\n[AAToARTSFunction] initialize: " 
+                      << F->getName() << "\n" << *F << "\n");
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    Function *F = getAnchorScope();
+    LLVM_DEBUG(dbgs() << "[AAToARTSFunction] updateImpl: " << F->getName() << "\n");
+    return ChangeStatus::UNCHANGED;
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    LLVM_DEBUG(dbgs() << "[AAToARTSFunction] Manifest\n");
+    return Changed;
+  }
+};
+
+AAToARTS &AAToARTS::createForPosition(const IRPosition &IRP,
+                                      Attributor &A) {
+  AAToARTS *AA = nullptr;
+  switch (IRP.getPositionKind()) {
+  case IRPosition::IRP_INVALID:
+  case IRPosition::IRP_ARGUMENT:
+  case IRPosition::IRP_CALL_SITE_ARGUMENT:
+  case IRPosition::IRP_RETURNED:
+  case IRPosition::IRP_CALL_SITE_RETURNED:
+  case IRPosition::IRP_FLOAT:
+  case IRPosition::IRP_CALL_SITE:
+    llvm_unreachable(
+        "AATDGInfo can only be created for function/callsite position!");
+    break;
+  case IRPosition::IRP_FUNCTION:
+    AA = new (A.Allocator) AAToARTSFunction(IRP, A);
+    break;
+  }
+  return *AA;
+}
+
+const char AAToARTS::ID = 0;
+
+
+/// AADataEnv
 /// This AbstractAttribute is used to obtain the data environment of a code 
 /// region, which is the set of variables that are private, shared, firstprivate
 /// and lastprivate.
@@ -97,6 +171,22 @@ struct AADataEnv : public StateWrapper<BooleanState, AbstractAttribute> {
 
   /// Data environment
   DataEnv DE;
+  const std::string getDataEnv() const {
+    std::string Str("---DATA ENVIRONMENT:\n");
+    /// Iterate through the firstprivate variables
+    for(auto *FPV : DE.FirstprivateVars)
+      Str += std::string("Firstprivate: ") + std::string(FPV->getName()) + std::string("\n");
+    /// Iterate through the private variables
+    for(auto *PV : DE.PrivateVars)
+      Str += std::string("Private: ") + std::string(PV->getName()) + std::string("\n");
+    /// Iterate through the shared variables
+    for(auto *SV : DE.SharedVars)
+      Str += std::string("Shared: ") + std::string(SV->getName()) + std::string("\n");
+    /// Iterate through the lastprivate variables
+    for(auto *LPV : DE.LastprivateVars)
+      Str += std::string("Lastprivate: ") + std::string(LPV->getName()) + std::string("\n");
+    return Str;
+  }
 };
 
 struct AADataEnvFunction : AADataEnv {
@@ -106,34 +196,37 @@ struct AADataEnvFunction : AADataEnv {
   const std::string getAsStr(Attributor *A) const override {
     if (!isValidState())
       return "<invalid>";
-
     std::string Str("AADataEnvFunction: ");
-
-    return Str + std::string("OK");
+    return Str + getDataEnv();
   }
 
   void initialize(Attributor &A) override {
     Function *F = getAnchorScope();
-    LLVM_DEBUG(dbgs() <<"\n[AADataEnvFunction] initialize: " << F->getName() << "\n" << *F << "\n");
+    LLVM_DEBUG(dbgs() <<"\n[AADataEnvFunction] initialize: " 
+                      << F->getName() << "\n" << *F << "\n");
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
     Function *F = getAnchorScope();
-
+    LLVM_DEBUG(dbgs() << "[AADataEnvFunction] updateImpl: " << F->getName() << "\n");
     /// Iterate through the BB of each function
     for(auto &BB : *F) {
-      /// Print function name and BB information
-      // LLVM_DEBUG(dbgs() << BB << "\n");
       /// Iterate through the instructions of each BB
       for(auto &I : BB) {
         if(auto *CB = dyn_cast<CallBase>(&I)) {
-          auto *DEAA= A.getOrCreateAAFor<AADataEnv>(
-            IRPosition::callsite_function(*CB), *this, DepClassTy::NONE, false, false);
+          auto *DEAA = A.getAAFor<AADataEnv>(
+            *this, IRPosition::callsite_function(*CB), DepClassTy::OPTIONAL);
+          if (!DEAA->getState().isValidState() || !DEAA->getState().isAtFixpoint()) {
+            LLVM_DEBUG(dbgs() <<"[AADataEnvFunction] DEAA is invalid or not at fixpoint\n");
+            continue;
+          }
+          /// if the DEAA is at fixpoint, print the data environment for now
+          LLVM_DEBUG(dbgs() << DEAA->getDataEnv() << "\n");
+          /// append the data environment
+          // DE.append(DEAA->DE);
         }
       }
     }
-    LLVM_DEBUG(dbgs() << "[AADataEnvFunction] updateImpl: " << F->getName() << "\n");
-    
     return ChangeStatus::UNCHANGED;
   }
 
@@ -153,8 +246,7 @@ struct AADataEnvCallSite : AADataEnv {
       return "<invalid>";
 
     std::string Str("AADataEnvCallSite: ");
-
-    return Str + std::string("OK");
+    return Str + getDataEnv();
   }
 
   void handleParallelRegion(CallBase &CB, Attributor &A) {
@@ -200,7 +292,7 @@ struct AADataEnvCallSite : AADataEnv {
     /// of the outline function. Otherwise, record 
   }
 
-  void handleTaskRegion(CallBase &CB, Attributor &A) {
+  ChangeStatus handleTaskRegion(CallBase &CB, Attributor &A) {
     LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Task alloc - FOUND\n");
     /* 
     For the shared variables we are interested, in all stores that are done to
@@ -232,7 +324,13 @@ struct AADataEnvCallSite : AADataEnv {
 
     If there is a load instruction that uses the returned value of the taskalloc
     function, we need to run the AAPointerInfo attributor on it.
+
+    The function returns ChangeStatus::CHANGED if the data environment is
+    updated, ChangeStatus::UNCHANGED otherwise.
     */
+    /// Aux variables
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    DataEnv AuxDE(DE.RTF, DE.F);
     /// Get context and module
     LLVMContext &Ctx = CB.getContext();
     Module *M = CB.getModule();
@@ -240,21 +338,18 @@ struct AADataEnvCallSite : AADataEnv {
     auto *kmp_task_t = dyn_cast<StructType>(CB.getType());
     auto kmp_task_t_size = M->getDataLayout().getTypeAllocSize(
       kmp_task_t->getTypeByName(Ctx, "struct.kmp_task_t"));
-    /// Print size
-    LLVM_DEBUG(dbgs() << "kmp_task_t size: " << kmp_task_t_size << "\n");
-
     /// Run AAPointerInfo on the returned value
     auto *PI = A.getAAFor<AAPointerInfo>(
       *this, IRPosition::callsite_returned(CB), DepClassTy::OPTIONAL);
     if (!PI->getState().isValidState()) {
       indicatePessimisticFixpoint();
       LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] AAPointerInfo is invalid\n");
-      return;
+      return Changed;
     }
     /// Is it a fixpoint?
     if (!PI->getState().isAtFixpoint()) {
       LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] AAPointerInfo is not at fixpoint\n");
-      return;
+      return Changed;
     }
     LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] AAPointerInfo is valid with: "
                       << PI->getOffsetBinsSize() << " bins\n");
@@ -280,30 +375,26 @@ struct AADataEnvCallSite : AADataEnv {
         }
         /// Store instruction. 
         if (AccKind == AAPointerInfo::AccessKind::AK_MUST_WRITE) {
-          LLVM_DEBUG(dbgs() << "       -- Store instruction\n");
+          // LLVM_DEBUG(dbgs() << "       -- Store instruction\n");
           Value *value = Acc.getWrittenValue();
           if(!value)
-            continue;
-          LLVM_DEBUG(dbgs() << "       - c: value " << *value << "\n");
-          // RangeAccesses[Range] = value;
-          // if (auto *PtII = dyn_cast<PtrToIntInst>(value)) {
-          //   LLVM_DEBUG(dbgs() << "       - PtrToIntInst\n");
-          // }
-          // else if (auto *CI = dyn_cast<ConstantInt>(value)) {
-          //   auto ConstantVal = CI->getSExtValue();
-          //   LLVM_DEBUG(dbgs() << "       - c: value " << ConstantVal << "\n");
-          // }
-          // else if (isa_and_nonnull<Function>(value)) {
-          //   LLVM_DEBUG(dbgs() << "       - c: func "
-          //                     << value->getName() << "\n");
-          // }
-          // else {
-          //   LLVM_DEBUG(dbgs() << "       - c: other " << *value << "\n");
-          // } 
+            return false;
+          /// Check if it is a shared variable
+          if(Range.Offset == 0) {
+            LLVM_DEBUG(dbgs() << "       - c: shared variable " << *value << "\n");
+            AuxDE.SharedVars.push_back(value);
+          }
+          /// Check if it is a firstprivate variable
+          else if(Range.Offset >= kmp_task_t_size) {
+            LLVM_DEBUG(dbgs() << "       - c: firstprivate variable " << *value << "\n");
+            AuxDE.FirstprivateVars.push_back(value);
+          }
+          else
+            LLVM_DEBUG(dbgs() << "       - c: other: " << *value << "\n");
         }
         /// Read instruction
         else if(AccKind == AAPointerInfo::AccessKind::AK_MUST_READ) {
-          LLVM_DEBUG(dbgs() << "       -- Read instruction\n");
+          // LLVM_DEBUG(dbgs() << "       -- Read instruction\n");
           /// Check if it a load instruction
           if(auto *LI = dyn_cast<LoadInst>(Inst)) {
             LLVM_DEBUG(dbgs() << "       - Load instruction. Running AA on this.\n");
@@ -317,18 +408,15 @@ struct AADataEnvCallSite : AADataEnv {
             /// Is it a fixpoint?
             if (!PIL->getState().isAtFixpoint()) {
               LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] PIL is not at fixpoint\n");
+              return false;
             }
-            else {
-              /// For all offset bins in the PI, run AccessCB
-              if(!PIL->forallOffsetBins(AccessCB)) {
-                LLVM_DEBUG(dbgs() << "PI forallOffsetBins failed\n");
-                indicatePessimisticFixpoint();
-                return false;
-              }
+            /// For all offset bins in the PI, run AccessCB
+            if(!PIL->forallOffsetBins(AccessCB)) {
+              LLVM_DEBUG(dbgs() << "PI forallOffsetBins failed\n");
+              indicatePessimisticFixpoint();
+              return false;
             }
           }
-          
-          // LLVM_DEBUG(dbgs() << "       - c: other " << *value << "\n");
         }
       }
       return true;
@@ -337,11 +425,17 @@ struct AADataEnvCallSite : AADataEnv {
     /// For all offset bins in the PI, run AccessCB
     if(!PI->forallOffsetBins(AccessCB)) {
       LLVM_DEBUG(dbgs() << "PI forallOffsetBins failed\n");
-      indicatePessimisticFixpoint();
-      // return;
+      /// We dont indicate fixpoint here. The analysis could've failed because
+      /// PI is not at fixpoint.
+      // indicatePessimisticFixpoint();
+      return Changed;
     }
     /// If we reach this point, it means that the PI is valid and at fixpoint.
-    // indicateOptimisticFixpoint();
+    indicateOptimisticFixpoint();
+    /// Append the data environment
+    DE.append(AuxDE);
+    Changed = ChangeStatus::CHANGED;
+    return Changed;
   }
 
   void initialize(Attributor &A) override {
@@ -369,7 +463,8 @@ struct AADataEnvCallSite : AADataEnv {
         We need to obtain its data environment. Since this pointer is used in
         functions that are not analyzable, and for purposes of this analysis we 
         are not interested on what happens inside those functions, we will
-        add the nocapture attribute.
+        add the nocapture attribute. A pointer is captured by the call if it
+        makes a copy of any part of the pointer that outlives the call.
         */
         for(auto &U : CB.uses()) {
           auto *User = U.getUser();
@@ -384,18 +479,18 @@ struct AADataEnvCallSite : AADataEnv {
             }
           }
         }
-        handleTaskRegion(CB, A);
+        /// Lets handle the task in the updateImpl function
         break;
       case OTHER: {
-        LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Other instruction - FOUND\n");
+        LLVM_DEBUG(dbgs() << "Other instruction - FOUND\n");
         /// Unknown caller or declarations are not analyzable, we give up.
         if (!Callee || !A.isFunctionIPOAmendable(*Callee)) {
           indicatePessimisticFixpoint();
-          LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] Unknown caller or declarations are not analyzable, we give up.\n");
+          LLVM_DEBUG(dbgs() <<"Unknown caller or declarations are not analyzable, we give up.\n");
           return;
         }
         /// If the callee is known and can be used in IPO. Run AA on the callee.
-        LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] Doing IPA for function.\n");
+        LLVM_DEBUG(dbgs() <<"Doing IPA for function.\n");
         auto *DEF = A.getAAFor<AADataEnv>(
             *this, IRPosition::function(*Callee), DepClassTy::NONE);
         // A.recordDependence(TDGInfoCS, *this, DepClassTy::REQUIRED, true);
@@ -426,14 +521,13 @@ struct AADataEnvCallSite : AADataEnv {
         // handleParallelRegion(CB);
       break;
       case TASKALLOC:
-        handleTaskRegion(CB, A);
+        Changed |= handleTaskRegion(CB, A);
       break;
       default: {
         // LLVM_DEBUG(dbgs() << "Other instruction - FOUND\n");
       }
       break;
     }
-
     return Changed;
   }
 
@@ -478,7 +572,12 @@ const char AADataEnv::ID = 0;
 /// ARTSTransform
 bool ARTSTransform::run() {
   bool changed = false;
-
+  /// Aux variables
+  LoopInfo *LI = nullptr;
+  DominatorTree *DT = nullptr;
+  /// Region counter
+  unsigned int ParallelRegion = 0;
+  unsigned int TaskRegion = 0;
   /// Get the main function
   LLVM_DEBUG(dbgs() << TAG << "Analyzing main function\n");
   auto *MainFunction = M.getFunction("main");
@@ -486,13 +585,93 @@ bool ARTSTransform::run() {
     LLVM_DEBUG(dbgs() << TAG << "Main function not found\n");
     return changed;
   }
-  // LLVM_DEBUG(dbgs() << *MainFunction << "\n");
-  A.getOrCreateAAFor<AADataEnv>(
-          IRPosition::function(*MainFunction), /* QueryingAA */ nullptr,
-          DepClassTy::NONE, /* ForceUpdate */ false,
-          /* UpdateAfterInit */ false);
+  /// Identify EDT regions
+  LLVM_DEBUG(dbgs() << TAG << "Identifying EDT regions\n");
+  /// For each function of the module
+  for(auto &F : M) {
+    if(!A.isFunctionIPOAmendable(F))
+      continue;
+    // LLVM_DEBUG(dbgs() << TAG << "Function: " << F << "\n\n");
+    /// Get entry block
+    BasicBlock *CurBB = &(F.getEntryBlock());
+    BasicBlock *NextBB = nullptr;
+    do {
+      // LLVM_DEBUG(dbgs() << TAG << "CurBB: " << *CurBB << "\n");
+      NextBB = CurBB->getNextNode();
+      /// Get first instruction of the function
+      Instruction *CurI = &(CurBB->front());
+      do {
+        // LLVM_DEBUG(dbgs() << TAG << "CurI: " << *CurI << "\n");
+        auto *CB = dyn_cast<CallBase>(CurI);
+        if (!CB)
+          continue;
+        /// Get the callee
+        Function *Callee = CB->getCalledFunction();
+        RTFunction RTF = getRTFunction(Callee);
+        switch (RTF) {
+          case PARALLEL: {
+            BasicBlock *Parallel = 
+              SplitBlock(CurI->getParent(), CurI, DT, LI, nullptr,
+                         "par.region." + std::to_string(ParallelRegion));
+            /// Split block again at the next instruction
+            CurI = CurI->getNextNonDebugInstruction();
+            BasicBlock *ParallelDone = 
+              SplitBlock(Parallel, CurI, DT, LI, nullptr,
+                         "par.done." + std::to_string(ParallelRegion));
+            NextBB = ParallelDone;
+            ParallelRegion++;
+          }
+          break;
+          case TASKALLOC: {
+            /// Split block at __kmpc_omp_task_alloc
+            BasicBlock *Task = 
+              SplitBlock(CurI->getParent(), CurI, DT, LI, nullptr,
+                         "task.region." + std::to_string(TaskRegion));
+            /// Find the task call
+            while ((CurI = CurI->getNextNonDebugInstruction())) {
+              auto *TCB = dyn_cast<CallBase>(CurI);
+              if(TCB && getRTFunction(TCB->getCalledFunction()) == RTFunction::TASK)
+                break;
+            }
+            assert(CurI && "Task RT call not found");
+            /// Split block again at the next instruction
+            CurI = CurI->getNextNonDebugInstruction();
+            BasicBlock *TaskDone = 
+              SplitBlock(Task, CurI, DT, LI, nullptr,
+                         "task.done." + std::to_string(TaskRegion));
+            NextBB = TaskDone;
+            TaskRegion++;
+            break;
+          }
+          break;
 
-  changed |= runAttributor();
+          default:
+            continue;
+          break;
+        }
+      } while ((CurI = CurI->getNextNonDebugInstruction()));
+
+    } while ((CurBB = NextBB));
+
+    // LLVM_DEBUG(dbgs() << TAG << "Function: " << F.getName() << " DONE\n\n");
+  }
+
+  LLVM_DEBUG(dbgs() << "\n" << TAG << "Module: \n" << M << "\n");
+
+  // /// Create and initialize ARTSIRBuilder
+  // ARTSIRBuilder ARTSIRB(M);
+  // ARTSIRB.initialize();
+  // Function *EDT = ARTSIRB.createEDT("fib");
+  // LLVM_DEBUG(dbgs() << TAG << "EDT: \n" << *EDT << "\n");
+  
+  changed = true;
+  // /// Create AA and run it
+  // A.getOrCreateAAFor<AADataEnv>(
+  //         IRPosition::function(*MainFunction), /* QueryingAA */ nullptr,
+  //         DepClassTy::NONE, /* ForceUpdate */ false,
+  //         /* UpdateAfterInit */ false);
+
+  // changed |= runAttributor();
   return changed;
 }
 
@@ -542,6 +721,7 @@ PreservedAnalyses ARTSTransformPass::run(Module &M, ModuleAnalysisManager &AM) {
   ARTSTransform ARTSTransform(M, A, Functions);
   Changed |= ARTSTransform.run();
 
+  LLVM_DEBUG(dbgs() << TAG << "Module after ARTSTransform Module Pass:\n" << M);
   if (Changed)
     return PreservedAnalyses::none();
 

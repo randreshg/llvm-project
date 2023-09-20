@@ -24,6 +24,23 @@ struct DataEnv {
   SmallVector<Value *, 4> SharedVars;
   SmallVector<Value *, 4> FirstprivateVars;
   SmallVector<Value *, 4> LastprivateVars;
+  /// Interface
+  DataEnv() : RTF(OTHER), F(nullptr) {};
+  DataEnv(RTFunction RTF, Function *F) : RTF(RTF), F(F) {};
+  void append(DataEnv &DE) {
+    if(DE.RTF != RTF)
+      return;
+    PrivateVars.append(DE.PrivateVars.begin(), DE.PrivateVars.end());
+    SharedVars.append(DE.SharedVars.begin(), DE.SharedVars.end());
+    FirstprivateVars.append(DE.FirstprivateVars.begin(), DE.FirstprivateVars.end());
+    LastprivateVars.append(DE.LastprivateVars.begin(), DE.LastprivateVars.end());
+  };
+};
+
+/// ARTS structures
+struct EDT {
+  Function *F;
+  DataEnv DE;
 };
 
 /// ARTS transform 

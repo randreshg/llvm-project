@@ -19,6 +19,7 @@ add_llvm_component_library(LLVMarts
   BitWriter
   Core
   FrontendOpenMP
+  FrontendARTS
   InstCombine
   IRReader
   Linker
