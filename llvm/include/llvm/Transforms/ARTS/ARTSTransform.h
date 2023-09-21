@@ -17,14 +17,10 @@ enum RTFunction {
   SET_NUM_THREADS
 };
 
+/// ---------------------------- DATA ENVIRONMENT ---------------------------- ///
+/// Struct to store information about the data environment of the OpenMP regions
 struct DataEnv {
-  RTFunction RTF;
-  Function *F;
-  SmallVector<Value *, 4> PrivateVars;
-  SmallVector<Value *, 4> SharedVars;
-  SmallVector<Value *, 4> FirstprivateVars;
-  SmallVector<Value *, 4> LastprivateVars;
-  /// Interface
+  /// ---------------------------- Interface ---------------------------- ///
   DataEnv() : RTF(OTHER), F(nullptr) {};
   DataEnv(RTFunction RTF, Function *F) : RTF(RTF), F(F) {};
   void append(DataEnv &DE) {
@@ -35,40 +31,62 @@ struct DataEnv {
     FirstprivateVars.append(DE.FirstprivateVars.begin(), DE.FirstprivateVars.end());
     LastprivateVars.append(DE.LastprivateVars.begin(), DE.LastprivateVars.end());
   };
+  /// ---------------------------- Attributes ---------------------------- ///
+  RTFunction RTF;
+  Function *F;
+  SmallVector<Value *, 4> PrivateVars;
+  SmallVector<Value *, 4> SharedVars;
+  SmallVector<Value *, 4> FirstprivateVars;
+  SmallVector<Value *, 4> LastprivateVars;
 };
 
-/// ARTS structures
-struct EDT {
+/// ---------------------------- EDT INFO ---------------------------- ///
+/// Struct to store information about EDTs
+struct EDTInfo {
+  /// ---------------------------- Interface ---------------------------- ///
+  EDTInfo() : F(nullptr) {};
+  EDTInfo(Function *F, DataEnv DE) : F(F), DE(DE) {};
+  EDTInfo(RTFunction RTF, Function *F) : F(nullptr), DE(RTF, F) {};
+  /// ---------------------------- Attributes ---------------------------- ///
   Function *F;
   DataEnv DE;
 };
 
-/// ARTS transform 
-struct ARTSTransform {
-  ARTSTransform(Module &M,  Attributor &A, SetVector<Function *> &Functions) 
-                : M(M), A(A), Functions(Functions) {}
-  bool run();
-  bool runAttributor();
+/// ---------------------------- ARTS TRANSFORM ---------------------------- ///
+struct ARTSTransformer {
+  /// ---------------------------- Interface ---------------------------- ///
+  ARTSTransformer(Module &M, SetVector<Function *> &Functions) 
+                : M(M), Functions(Functions) {}
+  bool run(Attributor &A);
+  bool runAttributor(Attributor &A);
 
-  /// Attributes
+  /// Return the EDT info for a given BB or `nullptr` if there are
+  /// none.
+  const EDTInfo *getEDTInfo(BasicBlock &BB) const {
+    auto I = EDTRegions.find(&BB);
+    if (I != EDTRegions.end())
+      return &(I->second.get());
+    return nullptr;
+  }
+
+private:
+  bool identifyEDTRegions();
+
+  /// ---------------------------- Attributes ---------------------------- ///
   /// The underlying module.
   Module &M;
-  /// Attributor instance.
-  Attributor &A;
   /// Set of valid functions in the module.
   SetVector<Function *> &Functions;
+  /// EDT Regions
+  DenseMap<BasicBlock *, EDTInfo > EDTRegions;
 };
 
+/// ---------------------------- ARTS TRANSFORM PASS ---------------------------- ///
 /// From OpenMP to ARTS transformation pass.
 class ARTSTransformPass : public PassInfoMixin<ARTSTransformPass> {
 public:
   ARTSTransformPass() = default;
-  // ARTSTransformPass(ThinOrFullLTOPhase LTOPhase) : LTOPhase(LTOPhase) {}
-
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
-
-private:
-  // const ThinOrFullLTOPhase LTOPhase = ThinOrFullLTOPhase::None;
 };
 } // namespace llvm
 
