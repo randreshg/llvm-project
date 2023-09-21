@@ -49,6 +49,13 @@ static RTFunction getRTFunction(Function *F) {
   return RTFunction::OTHER;
 }
 
+static RTFunction getRTFunction(CallBase &CB) {
+  auto *Callee = CB.getCalledFunction();
+  if(!Callee)
+    return RTFunction::OTHER;
+  return getRTFunction(Callee);
+}
+
 static bool isTaskFunction(Function *F) {
   auto RT = getRTFunction(F);
   if(RT == RTFunction::TASK || RT == RTFunction::TASKDEP || RT == RTFunction::TASKWAIT )
@@ -104,10 +111,9 @@ struct AADataEnv : public StateWrapper<BooleanState, AbstractAttribute> {
 
   static const char ID;
 
-  /// Data environment
-  DataEnv DE;
   const std::string getDataEnv() const {
-    std::string Str("---DATA ENVIRONMENT:\n");
+    std::string Str("---DATA ENVIRONMENT for ");
+    Str += std::string("Function: ") + std::string(DE.getCBName()) + std::string("\n");
     /// Iterate through the firstprivate variables
     for(auto *FPV : DE.FirstprivateVars)
       Str += std::string("Firstprivate: ") + std::string(FPV->getName()) + std::string("\n");
@@ -122,6 +128,9 @@ struct AADataEnv : public StateWrapper<BooleanState, AbstractAttribute> {
       Str += std::string("Lastprivate: ") + std::string(LPV->getName()) + std::string("\n");
     return Str;
   }
+
+  /// Data environment attribute
+  DataEnv DE;
 };
 
 struct AADataEnvFunction : AADataEnv {
@@ -186,12 +195,11 @@ struct AADataEnvCallSite : AADataEnv {
 
   ChangeStatus handleParallelRegion(CallBase &CB, Attributor &A) {
     LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Parallel region - FOUND\n");
+    if(!DE.F)
+      DE.F = dyn_cast<Function>(CB.getArgOperand(2));
+
     /// Get the number of arguments
     unsigned int NumArgs = CB.data_operands_size();
-    // LLVM_DEBUG(dbgs() << "Number of arguments: " << NumArgs << "\n");
-    auto OutlinedRegion = CB.getArgOperand(2);
-    DE.F = dyn_cast<Function>(OutlinedRegion);
-
     /// Get private and shared variables
     for(unsigned int i = 3; i < NumArgs; i++) {
       Value *Arg = CB.getArgOperand(i);
@@ -214,6 +222,7 @@ struct AADataEnvCallSite : AADataEnv {
 
       /// Do we need to consider private variables?
     }
+
     /// Run AA on the outline function
     // auto *DEF = A.getAAFor<AADataEnv>(
     //   *this, IRPosition::function(*DE.F), DepClassTy::NONE);
@@ -231,44 +240,45 @@ struct AADataEnvCallSite : AADataEnv {
   }
 
   ChangeStatus handleTaskRegion(CallBase &CB, Attributor &A) {
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Task alloc - FOUND\n");
-    /* 
-    For the shared variables we are interested, in all stores that are done to
-    the shareds field of the kmp_task_t struct. For the firstprivate variables
-    we are interested in all stores that are done to the privates field of the
-    kmp_task_t_with_privates struct.
+    // For the shared variables we are interested, in all stores that are done to
+    // the shareds field of the kmp_task_t struct. For the firstprivate variables
+    // we are interested in all stores that are done to the privates field of the
+    // kmp_task_t_with_privates struct.
+    //
+    // The AAPointerInfo attributor is used to obtain the access (read/write,
+    // offsets and size) of a value. This attributor is run on the returned value
+    // of the taskalloc function. The returned value is a pointer to the
+    // kmp_task_t_with_privates struct.
+    // struct kmp_task_t_with_privates {
+    //    kmp_task_t task_data;
+    //    kmp_privates_t privates;
+    // };
+    // typedef struct kmp_task {
+    //   void *shareds;
+    //   kmp_routine_entry_t routine;
+    //   kmp_int32 part_id;
+    //   kmp_cmplrdata_t data1;
+    //   kmp_cmplrdata_t data2;
+    // } kmp_task_t;
+    //
+    // - For shared variables, the access of the shareds field is obtained by
+    // obtaining stores done to offset 0 of the returned value of the taskalloc.
+    // -For firstprivate variables, the access of the privates field is obtained by
+    // obtaining stores done to offset 8 of the returned value of the
+    // kmp_task_t_with_privates struct.
+    //
+    // If there is a load instruction that uses the returned value of the taskalloc
+    // function, we need to run the AAPointerInfo attributor on it.
+    //
+    // The function returns ChangeStatus::CHANGED if the data environment is
+    // updated, ChangeStatus::UNCHANGED otherwise.
 
-    The AAPointerInfo attributor is used to obtain the access (read/write,
-    offsets and size) of a value. This attributor is run on the returned value
-    of the taskalloc function. The returned value is a pointer to the
-    kmp_task_t_with_privates struct.
-    struct kmp_task_t_with_privates {
-       kmp_task_t task_data;
-       kmp_privates_t privates;
-    };
-    typedef struct kmp_task {
-      void *shareds;
-      kmp_routine_entry_t routine;
-      kmp_int32 part_id;
-      kmp_cmplrdata_t data1;
-      kmp_cmplrdata_t data2;
-    } kmp_task_t;
-
-    - For shared variables, the access of the shareds field is obtained by
-    obtaining stores done to offset 0 of the returned value of the taskalloc.
-    -For firstprivate variables, the access of the privates field is obtained by
-    obtaining stores done to offset 8 of the returned value of the
-    kmp_task_t_with_privates struct.
-
-    If there is a load instruction that uses the returned value of the taskalloc
-    function, we need to run the AAPointerInfo attributor on it.
-
-    The function returns ChangeStatus::CHANGED if the data environment is
-    updated, ChangeStatus::UNCHANGED otherwise.
-    */
-    /// Aux variables
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    DataEnv AuxDE(DE.RTF, DE.F);
+    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Task alloc - FOUND\n");
+    /// Aux variables
+    if(!DE.F)
+      DE.F = dyn_cast<Function>(CB.getArgOperand(5));
+    DataEnv AuxDE(DE);
     /// Get context and module
     LLVMContext &Ctx = CB.getContext();
     Module *M = CB.getModule();
@@ -276,7 +286,7 @@ struct AADataEnvCallSite : AADataEnv {
     auto *kmp_task_t = dyn_cast<StructType>(CB.getType());
     auto kmp_task_t_size = M->getDataLayout().getTypeAllocSize(
       kmp_task_t->getTypeByName(Ctx, "struct.kmp_task_t"));
-    /// Run AAPointerInfo on the returned value
+    /// Run AAPointerInfo on the callbase
     auto *PI = A.getAAFor<AAPointerInfo>(
       *this, IRPosition::callsite_returned(CB), DepClassTy::OPTIONAL);
     if (!PI->getState().isValidState()) {
@@ -372,16 +382,16 @@ struct AADataEnvCallSite : AADataEnv {
     indicateOptimisticFixpoint();
     /// Append the data environment
     DE.append(AuxDE);
-    Changed = ChangeStatus::CHANGED;
-    return Changed;
+    return ChangeStatus::CHANGED;
   }
 
   void initialize(Attributor &A) override {
     CallBase &CB = cast<CallBase>(getAssociatedValue());
     Function *Callee = getAssociatedFunction();
     LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] ----- initialize: " << Callee->getName() << "\n");
-    RTF = getRTFunction(Callee);
-    switch (RTF) {
+    DE.CB = &CB;
+    DE.RTF = getRTFunction(Callee);
+    switch (DE.RTF) {
       case SET_NUM_THREADS: {
         auto *Arg = CB.getArgOperand(0);
         if(auto *NumThreads = dyn_cast<ConstantInt>(Arg)) {
@@ -394,8 +404,7 @@ struct AADataEnvCallSite : AADataEnv {
       case PARALLEL:
         handleParallelRegion(CB, A);
       break;
-      case TASKALLOC:
-        DE.RTF = RTF;
+      case TASKALLOC: {
         /// The task is created by the taskalloc function, and it returns a
         /// pointer to the task (check handleTaskRegion documentation ). 
         /// We need to obtain its data environment. Since this pointer is used in
@@ -417,7 +426,7 @@ struct AADataEnvCallSite : AADataEnv {
           }
         }
         /// Lets handle the task in the updateImpl function
-        break;
+      } break;
       case OTHER: {
         LLVM_DEBUG(dbgs() << "Other instruction - FOUND\n");
         /// Unknown caller or declarations are not analyzable, we give up.
@@ -436,13 +445,11 @@ struct AADataEnvCallSite : AADataEnv {
         //   indicatePessimisticFixpoint();
         //   LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] TDGInfoCS is invalid\n");
         // }
-      }
-      break;
+      } break;
       /// Default
       default: {
         LLVM_DEBUG(dbgs() << "Other instruction - FOUND\n");
-      }
-      break;
+      } break;
     }
   }
 
@@ -477,10 +484,6 @@ struct AADataEnvCallSite : AADataEnv {
 
   /// Private attributes
   RTFunction RTF;
-  /// Map that contains the range accesses of the task
-  /// DenseMap to map RangeTy objects to Value objects
-  // llvm::DenseMap<AA::RangeTy, const llvm::Value *> RangeAccesses;
-  // SmallVector<RangeAccess, 4> RangeAccesses;
 };
 
 AADataEnv &AADataEnv::createForPosition(const IRPosition &IRP,
@@ -595,7 +598,17 @@ struct AAToARTSFloating : AAToARTS {
       return;
     }
     LLVM_DEBUG(dbgs() <<"[AAToARTSFloating] BasicBlock: " << BB << "\n");
-    LLVM_DEBUG(dbgs() <<"[AAToARTSFloating] Analyzing: " << DE.F->getName() << "\n");
+    LLVM_DEBUG(dbgs() <<"[AAToARTSFloating] Analyzing: " << DE.getCBName() << "\n");
+    /// Run DEAA on the data environment
+    auto *DEAA = A.getAAFor<AADataEnv>(
+      *this, IRPosition::callsite_function(*DE.CB), DepClassTy::OPTIONAL);
+    if (!DEAA->getState().isValidState() || !DEAA->getState().isAtFixpoint()) {
+      LLVM_DEBUG(dbgs() <<"[AAToARTSFloating] DEAA is invalid or not at fixpoint\n");
+      indicatePessimisticFixpoint();
+      return;
+    }
+    /// Convert DE Function to CallBase
+    // CallBase &CB = cast<CallBase>(*DE.getCBFunction()->getEntryBlock().getFirstInsertionPt());
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
@@ -678,7 +691,7 @@ bool ARTSTransformer::identifyEDTRegions() {
   /// - __kmpc_omp_taskwait or __kmpc_omp_taskwait_deps
   /// - function with a pointer return type (not void) that is used 
   ///   after the call.
-
+  ///
   /// The BB that meet the criteria are split into two BBs. Check example:
   /// BB1:
   ///   %0 = alloca i32, align 4
@@ -695,14 +708,14 @@ bool ARTSTransformer::identifyEDTRegions() {
   /// par.done.0:
   ///   ...
   ///   ret i32 0
-
+  ///
   /// For the example above, the BB that contains the call to __kmpc_fork_call will be then 
   /// replaced by the EDT initializer (GUID reserve + call to EDT allocator) and the parallel
   /// outlined function will be the EDT.
   /// We then have to analyze whether the par.done BB needs to be transformed to an EDT. This
   /// is done by analyzing the instructions of the BB to obtain its data environment. If any
   /// of the instructions in the BB uses a shared variable, the BB is transformed to an EDT.
-
+  ///
   /// By the end of this function, we should have a map that contains the BBs that can be
   /// transformed to EDTs. The key of the map is the BB that contains the call to the function
   /// that creates the region (e.g. __kmpc_fork_call) and the value is the struct EDTInfo.
@@ -748,7 +761,7 @@ bool ARTSTransformer::identifyEDTRegions() {
                          "par.done." + std::to_string(ParallelRegion));
             NextBB = ParallelDone;
             /// Add the parallel region to the map
-            EDTInfo EI(RTF, Callee);
+            EDTInfo EI(RTF, CB);
             EDTRegions.insert(std::make_pair(Parallel, EI));
             ParallelRegion++;
           }
@@ -772,7 +785,7 @@ bool ARTSTransformer::identifyEDTRegions() {
                          "task.done." + std::to_string(TaskRegion));
             NextBB = TaskDone;
             /// Add the task region to the map
-            EDTInfo EI(RTF, Callee);
+            EDTInfo EI(RTF, CB);
             EDTRegions.insert(std::make_pair(Task, EI));
             TaskRegion++;
             break;
@@ -804,7 +817,7 @@ bool ARTSTransformer::identifyEDTRegions() {
   for(auto &E : EDTRegions) {
     LLVM_DEBUG(dbgs() << TAG << "Region: " << *(E.first));
     // LLVM_DEBUG(dbgs() << TAG << "Region type: " << E.second.RTF << "\n");
-    LLVM_DEBUG(dbgs() << TAG << "Region function: " << E.second.DE.F->getName() << "\n\n");
+    LLVM_DEBUG(dbgs() << TAG << "Region function: " << E.second.DE.getCBName() << "\n\n");
   }
   LLVM_DEBUG(dbgs() << "\n" << TAG << "Module: \n" << M << "\n");
 

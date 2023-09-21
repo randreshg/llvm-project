@@ -21,19 +21,46 @@ enum RTFunction {
 /// Struct to store information about the data environment of the OpenMP regions
 struct DataEnv {
   /// ---------------------------- Interface ---------------------------- ///
-  DataEnv() : RTF(OTHER), F(nullptr) {};
-  DataEnv(RTFunction RTF, Function *F) : RTF(RTF), F(F) {};
+  DataEnv() : RTF(OTHER), CB(nullptr), F(nullptr) {};
+  DataEnv(DataEnv &DE) : RTF(DE.RTF), CB(DE.CB), F(F) {};
+  DataEnv(RTFunction RTF, CallBase *CB) 
+    : RTF(RTF), CB(CB), F(nullptr) {};
+  DataEnv(RTFunction RTF, CallBase *CB, Function *F) 
+    : RTF(RTF), CB(CB), F(F) {};
+
   void append(DataEnv &DE) {
-    if(DE.RTF != RTF)
+    if(DE.RTF != RTF || DE.CB != CB)
       return;
+    if(DE.F && !F)
+      F = DE.F;
     PrivateVars.append(DE.PrivateVars.begin(), DE.PrivateVars.end());
     SharedVars.append(DE.SharedVars.begin(), DE.SharedVars.end());
     FirstprivateVars.append(DE.FirstprivateVars.begin(), DE.FirstprivateVars.end());
     LastprivateVars.append(DE.LastprivateVars.begin(), DE.LastprivateVars.end());
   };
+
+  StringRef getCBName() {
+    if(CB)
+      return CB->getCalledFunction()->getName();
+    return "";
+  }
+
+  StringRef getFName() {
+    if(F)
+      return F->getName();
+    return "";
+  }
+
+  Function *getCBFunction() {
+    if(CB)
+      return CB->getCalledFunction();
+    return nullptr;
+  }
+
   /// ---------------------------- Attributes ---------------------------- ///
   RTFunction RTF;
-  Function *F;
+  CallBase *CB;         // CallBase of the OpenMP region
+  Function *F;          // Pointer to the outlined function
   SmallVector<Value *, 4> PrivateVars;
   SmallVector<Value *, 4> SharedVars;
   SmallVector<Value *, 4> FirstprivateVars;
