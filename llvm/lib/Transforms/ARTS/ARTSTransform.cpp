@@ -118,8 +118,10 @@ struct AADataEnv : public StateWrapper<BooleanState, AbstractAttribute> {
 
   static const char ID;
 
-  /// Data environment attribute
-  DataEnv DE;
+  /// Map that contains all the instructions that may read/write
+  /// memory. The key is the basic block and the value is a vector
+  /// of instructions.
+  DenseMap<BasicBlock *, SmallVector<Instruction *>> BBInstMap;
 };
 
 struct AADataEnvBasicBlock : AADataEnv {
@@ -418,8 +420,8 @@ struct AADataEnvFunction : AADataEnv {
       /// Other?
       else 
         LLVM_DEBUG(dbgs() << "  - Other\n");
-      /// For now, we simply add them to the BBDEMap
-      BBDEMap[BB].push_back(&I);
+      /// For now, we simply add them to the BBInstMap
+      BBInstMap[BB].push_back(&I);
       // if (auto *SI = dyn_cast<StoreInst>(&I)) {
       //   // const auto *UnderlyingObjsAA = A.getAAFor<AAUnderlyingObjects>(
       //   //     *this, IRPosition::value(*SI->getPointerOperand()),
@@ -447,14 +449,7 @@ struct AADataEnvFunction : AADataEnv {
             CheckRWInst, *this, UsedAssumedInformationInCheckRWInst))
       LLVM_DEBUG(dbgs() << "  - checkForAllReadWriteInstructions failed\n");
     
-    /// For now, we simply print the BBDEMap
-    LLVM_DEBUG(dbgs() << "\nBBDEMap:\n");
-    for(auto &BBDE : BBDEMap) {
-      BasicBlock *BB = BBDE.first;
-      LLVM_DEBUG(dbgs() << "BasicBlock: " << BB->getName() << "\n");
-      for(auto *I : BBDE.second)
-        LLVM_DEBUG(dbgs() << "  - " << *I << "\n");
-    }
+    
 
 
     /// If it is not an EDT region, get data environment based on the 
@@ -478,7 +473,8 @@ struct AADataEnvFunction : AADataEnv {
     // /// Debug - dump memory SSA analysis
     // LLVM_DEBUG(dbgs() << "Memory SSA analysis:\n");
     // MSSA.dump();
-    return ChangeStatus::UNCHANGED;
+    indicateOptimisticFixpoint();
+    return ChangeStatus::CHANGED;
   }
 
   ChangeStatus manifest(Attributor &A) override {
@@ -846,7 +842,6 @@ struct AAToARTSFunction : AAToARTS {
     return Str + "OK";
   }
 
-
   bool identifyEDTInitRegions(Function &F, ARTSTransformer &AT, Attributor &A) {
     bool Changed = false;
     /// This function identifies the regions that will be transformed to
@@ -885,6 +880,7 @@ struct AAToARTSFunction : AAToARTS {
     /// transformed to EDTs. The key of the map is the BB that contains the call to the function
     /// that creates the region (e.g. __kmpc_fork_call) and the value is the struct EDTInfo.
 
+
     /// Aux variables
     LoopInfo *LI = nullptr;
     DominatorTree *DT = nullptr;
@@ -894,6 +890,8 @@ struct AAToARTSFunction : AAToARTS {
     unsigned int TaskRegion = 0;
 
     LLVM_DEBUG(dbgs() << TAG << "Identifying EDT regions\n");
+    EDTInfo *EI = AT.insertEDT();
+
     if(!A.isFunctionIPOAmendable(F))
       return Changed;
     /// Get entry block
@@ -901,6 +899,7 @@ struct AAToARTSFunction : AAToARTS {
     BasicBlock *NextBB = nullptr;
     do {
       // LLVM_DEBUG(dbgs() << TAG << "CurBB: " << *CurBB << "\n");
+      EI->insertEDTBody(EDTBody::OTHER, CurBB);
       NextBB = CurBB->getNextNode();
       /// Get first instruction of the function
       Instruction *CurI = &(CurBB->front());
@@ -914,27 +913,30 @@ struct AAToARTSFunction : AAToARTS {
         RTFunction RTF = getRTFunction(Callee);
         switch (RTF) {
           case PARALLEL: {
-            // CurBB->setName("edt.region." + std::to_string(EDTInitRegion));
+            /// Split block at __kmpc_parallel
             BasicBlock *ParallelBB = 
               SplitBlock(CurI->getParent(), CurI, DT, LI, nullptr,
                         "par.region." + std::to_string(ParallelRegion));
+            EI->insertEDTBody(EDTBody::INIT, ParallelBB);
             /// Split block at the next instruction
             CurI = CurI->getNextNonDebugInstruction();
             BasicBlock *ParallelDone = 
               SplitBlock(ParallelBB, CurI, DT, LI, nullptr,
                         "par.done." + std::to_string(ParallelRegion));
             NextBB = ParallelDone;
-            /// Add the parallel region to the map
-            AT.insertEDTInitRegion(ParallelBB, RTF, CB);
             ParallelRegion++;
+            /// Create new EDT and add dependency from par.region 
+            /// to par.done
+            EI = AT.insertEDTWithDep(EI);
+            EI.insertEDTBody(EDTBody::OTHER, ParallelDone);
           }
           break;
           case TASKALLOC: {
-            // CurBB->setName("edt.region." + std::to_string(EDTInitRegion));
             /// Split block at __kmpc_omp_task_alloc
             BasicBlock *TaskBB = 
               SplitBlock(CurI->getParent(), CurI, DT, LI, nullptr,
                         "task.region." + std::to_string(TaskRegion));
+            EI->insertEDTBody(EDTBody::INIT, TaskBB);
             /// Find the task call
             while ((CurI = CurI->getNextNonDebugInstruction())) {
               auto *TCB = dyn_cast<CallBase>(CurI);
@@ -948,9 +950,11 @@ struct AAToARTSFunction : AAToARTS {
               SplitBlock(TaskBB, CurI, DT, LI, nullptr,
                         "task.done." + std::to_string(TaskRegion));
             NextBB = TaskDone;
-            /// Add the task region to the map
-            AT.insertEDTInitRegion(TaskBB, RTF, CB);
             TaskRegion++;
+            /// Create new EDT and add dependency from par.region 
+            /// to par.done
+            EI = AT.insertEDTWithDep(EI);
+            EI.insertEDTBody(EDTBody::OTHER, TaskDone);
           }
           break;
           case TASKWAIT: {
@@ -1032,7 +1036,19 @@ struct AAToARTSFunction : AAToARTS {
       return;
     }
     LLVM_DEBUG(dbgs() <<"[AAToARTSFunction] DEAA is at fixpoint\n");
+    /// For now, we simply print the BBInstMap
+    LLVM_DEBUG(dbgs() << "\nBBInstMap:\n");
+    for(auto &BBDE : DEAA->BBInstMap) {
+      BasicBlock *BB = BBDE.first;
+      LLVM_DEBUG(dbgs() << "BasicBlock: " << BB->getName() << "\n");
+      for(auto *I : BBDE.second)
+        LLVM_DEBUG(dbgs() << "  - " << *I << "\n");
+    }
 
+    /// Iterate through each basic block of the function
+    for(auto &BB : F) {
+
+    }
 
   //   /// For every EDT init region, run the AADataEnv
   //   for(auto &E : AT.EDTInitRegions) {

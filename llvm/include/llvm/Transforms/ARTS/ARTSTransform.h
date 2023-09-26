@@ -98,31 +98,112 @@ inline raw_ostream &operator<<(raw_ostream &OS, DataEnv &DE) {
 
 /// ---------------------------- SIGNAL INFO ---------------------------- ///
 struct EDTInfo;
-struct SignalInfo {
+
+struct EDTDep {
   /// ---------------------------- Interface ---------------------------- ///
-  // SignalInfo() : F(nullptr), CB(nullptr) {};
-  // SignalInfo(Function *F, CallBase *CB) : F(F), CB(CB) {};
-  // SignalInfo(RTFunction RTF, CallBase *CB) 
-  //   : F(nullptr), CB(CB) {};
+  EDTDep() : EDT(nullptr) {};
+  EDTDep(EDTInfo *EDT) : EDT(EDT) {};
+  // EDTDep(EDTInfo *EDT, DataEnv *DE) : EDT(EDT), DE(DE) {};
+
   /// ---------------------------- Attributes ---------------------------- ///
-  Value *v;            // Value to signal
-  EDTInfo *EDTI;       // EDT where the value will be signaled to
-};
+  // EDT where the value will be signaled to
+  EDTInfo *EDTI;
+  /// Values to be signaled
+  SmallVector<Value*, 4> values;
+}
 
 /// ---------------------------- EDT INFO ---------------------------- ///
+/// Struct to store information about the EDT initializer
+struct EDTInitInfo {
+  /// ---------------------------- Interface ---------------------------- ///
+  EDTInitInfo() : F(nullptr), CB(nullptr) {};
+  EDTInitInfo(Function *F, CallBase *CB) : F(F), CB(CB) {};
+  EDTInitInfo(RTFunction RTF, CallBase *CB) 
+    : F(nullptr), CB(CB) {};
+  /// ---------------------------- Attributes ---------------------------- ///
+  /// List of basic blocks that are part of the EDT initializer
+  SmallVector<BasicBlock*, 4> EDTInit;
+  /// 
+  Function *F;          // Pointer to the outlined function
+  CallBase *CB;         // CallBase of the OpenMP region
+};
+
+struct EDTBody {
+  /// ---------------------------- Interface ---------------------------- ///
+  EDTBody() : Ty(OTHER), BB(nullptr) {};
+  EDTBody(EDTBodyType Ty, BasicBlock *BB) : Ty(Ty), BB(BB) {};
+  EDTBody(EDTBody EDTB) : Ty(EDTB.Ty), BB(EDTB.BB) {};
+
+  /// ---------------------------- Attributes ---------------------------- ///
+  enum Type {
+    OTHER = 0,
+    INIT_ALLOCA,
+    INIT,
+    EVENT
+  };
+  EDTBodyType Ty;
+  BasicBlock *BB;
+  bool transformed = false;
+}
+
+inline raw_ostream &operator<<(raw_ostream &OS, EDTBody &EB) {
+  StringRef transformed = EB.transformed ? "True: " : "False";
+  if(EB.type == EDTBody::INIT_ALLOCA)
+    OS << "Init Alloca"
+  else if(EB.type == EDTBody::INIT)
+    OS << "Init";
+  else if(EB.type == EDTBody::EVENT)
+    OS << "Event";
+  else
+    OS << "Other";
+  OS << " - Transformed: "<< transformed << *(EB.BB) << "\n";
+  return OS;
+}
+
 /// Struct to store information about EDTs
 struct EDTInfo {
   /// ---------------------------- Interface ---------------------------- ///
-  EDTInfo() : F(nullptr) {};
+  EDTInfo(uint64_t ID) : ID(ID), F(nullptr) {};
   EDTInfo(Function *F, DataEnv DE) : F(F), DE(DE) {};
   EDTInfo(RTFunction DE_RTF, CallBase *DE_CB) 
     : F(nullptr), DE(DE_RTF, DE_CB) {};
+
+  void insertEDTBody(EDTBody Body) {
+    EDTBody *EDTB = new EDTBody(Body);
+    body.push_back(EDTB);
+  }
+
+  void insertEDTBody(EDTBodyType Ty, BasicBlock *BB) {
+    EDTBody *EDTB = new EDTBody(Ty, BB);
+    body.push_back(EDTB);
+  }
+
+  void addDep(EDTDep *SI) {
+    deps.push_back(SI);
+  }
+
   /// ---------------------------- Attributes ---------------------------- ///
-  uint64_t GUID;            // GUID of the EDT
-  Function *F;              // Pointer to the EDT function
-  DataEnv DE;               // Data environment of the EDT
-  SmallVector<SignalInfo*, 4> signal;
+  /// GUID of the EDT
+  uint64_t ID;
+  // Pointer to the EDT function
+  Function *F;
+  /// Data environment of the EDT
+  DataEnv DE;
+  /// List of EDT Dependencies - successors
+  SmallVector<EDTDep*, 4> deps;
+  /// List of BasicBlocks that are part of the EDT
+  SmallVector<EDTBody*, 4> body;
 };
+
+inline raw_ostream &operator<<(raw_ostream &OS, EDTInfo &EI) {
+  OS << "EDT body: " << body.size() << "\n";
+  for(auto *EDTB : body)
+    OS << "  - " << *EDTB << "\n";
+  OS << "EDT deps: " << deps.size() << "\n";
+
+  OS << "\n";
+  return OS;
+}
 
 /// ---------------------------- ARTS TRANSFORM ---------------------------- ///
 struct ARTSTransformer {
@@ -164,14 +245,47 @@ struct ARTSTransformer {
     insertEDTInitRegion(BB, new EDTInfo(DE_RTF, DE_CB));
   }
 
+  /// ---------------------------- Helper Functions ---------------------------- ///
+  /// Insert EDT
+  EDTInfo *insertEDT() {
+    EDTInfo *EDTI = new EDTInfo(EDTID++);
+    EDTs.push_back(EDTI);
+    return EDTI;
+  }
+
+  /// Insert EDT and add dependency. 
+  /// Creates a new EDT and adds a dependency from the 
+  /// given EDT to the new one.
+  EDTInfo *insertEDTWithDep(EDTInfo *from) {
+    EDTInfo *EDTI = insertEDT(EDTID++);
+    /// Create dependency
+    EDTDep *SI = new EDTDep(EDTI);
+    from->addDep(SI);
+    /// Return new EDT
+    return EDTI;
+  }
+
   /// ---------------------------- Attributes ---------------------------- ///
   /// The underlying module.
   Module &M;
   /// Set of valid functions in the module.
   // SetVector<Function *> &Functions;
-  /// EDT Regions
+  /// List of EDTs
+  uint64_t EDTID = 0;
+  SmallVector<EDTInfo*, 4> EDTs;
+  /// EDT Init Regions
   DenseMap<BasicBlock *, EDTInfo *> EDTInitRegions;
+  /// 
 };
+
+inline raw_ostream &operator<<
+    (raw_ostream &OS, SmallVector<EDTInfo*, 4> &EDTs) {
+  OS << "EDTs: " << EDTs.size() << "\n";
+  for(auto *EDTI : EDTs)
+    OS << "  - " << *EDTI << "\n";
+  OS << "\n";
+  return OS;
+}
 
 /// ---------------------------- ARTS TRANSFORM PASS ---------------------------- ///
 /// From OpenMP to ARTS transformation pass.
