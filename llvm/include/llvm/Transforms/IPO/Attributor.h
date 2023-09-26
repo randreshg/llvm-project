@@ -756,6 +756,8 @@ struct IRPosition {
       return cast<Argument>(V).getParent();
     if (isa<Instruction>(V))
       return cast<Instruction>(V).getFunction();
+    if(isa<BasicBlock>(V))
+      return cast<BasicBlock>(V).getParent();
     return nullptr;
   }
 

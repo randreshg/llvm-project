@@ -123,7 +123,7 @@ AllocaInst *ARTSIRBuilder::reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node) {
   auto OldInsertPoint = Builder.saveIP();
   Builder.SetInsertPoint(EntryBB);
   /// Create the call to reserve the GUID
-  ConstantInt *ARTS_EDT_Enum = ConstantInt::get(M.getContext(), APInt(32, 1));
+  ConstantInt *ARTS_EDT_Enum = ConstantInt::get(Builder.getContext(), APInt(32, 1));
   Value *Args[] = {
       ARTS_EDT_Enum,
       Builder.CreateIntCast(ConstantInt::get(Int32, Node), Int32, /*isSigned*/ false)
@@ -132,51 +132,105 @@ AllocaInst *ARTSIRBuilder::reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node) {
       getOrCreateRuntimeFunctionPtr(ARTSRTL_artsReserveGuidRoute), Args);
   /// Create allocation of the GUID
   AllocaInst *GuidAddr = Builder.CreateAlloca(Int32Ptr, nullptr, "guid.addr");
-  Builder.restoreIP(OldInsertPoint);
-  /// Store the GUID in the allocation
+  /// Store the GUID
   Builder.CreateStore(ReserveGuidCall, GuidAddr);
+  Builder.restoreIP(OldInsertPoint);
   return GuidAddr;
 }
 
-Function *ARTSIRBuilder::createEDT(StringRef FuncName) {
-  LLVM_DEBUG(dbgs() << TAG <<  "Creating EDT " << FuncName << "\n");
-  /// Create EDT function
-  Function *Func = Function::Create(EdtFunction, 
-    GlobalValue::InternalLinkage, FuncName, M);
+Function *ARTSIRBuilder::createEDT(StringRef Name) {
+  LLVM_DEBUG(dbgs() << TAG <<  "Creating EDT\n");
+  // StringRef FuncName = Name + ".edt";
+  Function *Func = Function::Create(EdtFunction, GlobalValue::InternalLinkage, Name, M);
+  /// Add entry BB that returns void
+  BasicBlock *EntryBB = BasicBlock::Create(Builder.getContext(), "entry", Func);
+  Builder.SetInsertPoint(EntryBB);
+  Builder.CreateRetVoid();
+  return Func;
+}
+
+Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBlock *CurBB) {
+  auto &DE = EI.DE;
+  LLVM_DEBUG(dbgs() << TAG <<  "Creating EDT for " << DE.getCBName() << "\n");
+  /// Get CurBB parent
+  Function *Func = CurBB->getParent();
+  LLVM_DEBUG(dbgs() << TAG <<  "CurBB parent: " << Func->getName() << "\n");
   /// Generate entry region. 
   /// This region will have the declarations of the GUIDs.
   BasicBlock *EntryBB = BasicBlock::Create(Builder.getContext(), "edt.entry", Func);
-  Builder.SetInsertPoint(EntryBB);
+  StringRef BBNameAppend = "";
+  if(CurBB) {
+    /// Create a copy of CurBB terminator
+    Instruction *Term = CurBB->getTerminator();
+    if(!Term) {
+      LLVM_DEBUG(dbgs() << TAG <<  "CurBB has no terminator\n");
+      // return nullptr;
+    }
+    else
+      LLVM_DEBUG(dbgs() << TAG <<  "CurBB has terminator: " << *Term << "\n");
+    // redirectTo(CurBB, EntryBB);
+    BBNameAppend = CurBB->getName();
+    EntryBB->setName("edt.entry." + BBNameAppend);
+  }
   /// Reserve the GUIDs for the EDTs
   AllocaInst *GuidAddr = reserveEDTGuid(EntryBB, 0);
   /// Create EDT body
-  BasicBlock *BodyBB = BasicBlock::Create(Builder.getContext(), "edt.body", Func);
+  BasicBlock *BodyBB = BasicBlock::Create(
+    Builder.getContext(), "edt.body." + BBNameAppend, Func);
   Builder.SetInsertPoint(BodyBB);
   /// Branch to the body
   redirectTo(EntryBB, BodyBB);
-  /// Assume simple example
+
+  /// Paramc are the number of static parameters.
+  /// It corresponds to the number of first private variables.
+  int32_t NumParamC = DE.FirstprivateVars.size();
   AllocaInst *ParamC = Builder.CreateAlloca(Int32, nullptr, "paramc");
-  Builder.CreateStore(ConstantInt::get(Int32, 2), ParamC);
+  Builder.CreateStore(ConstantInt::get(Int32, NumParamC), ParamC);
 
-  AllocaInst *ParamVAddr = Builder.CreateAlloca(Int64Ptr, nullptr, "paramv.addr");
+  /// Paramv are the static parameters that are copied into the EDT closure.
+  /// It corresponds to the private variables.
+  AllocaInst *ParamVArray = Builder.CreateAlloca(Int64Ptr, nullptr, "paramv.array");
+  for (auto En : enumerate(DE.FirstprivateVars)) {
+    unsigned Index = En.index();
+    Value *Val = En.value();
+    /// Create the GEP to store the value in the ParamV array
+    Value *ParamVArrayElemPtr = Builder.CreateConstInBoundsGEP2_64(
+        Int64Ptr, ParamVArray, 0, Index, "paramv.array.elem." + Twine(Index));
+    /// If the value is a constant int, we need to store it in a variable
+    if (ConstantInt *CI = dyn_cast<ConstantInt>(Val)) {
+      /// Create the variable
+      Val = Builder.CreateAlloca(Int32, nullptr, "paramv.val." + Twine(Index));
+      /// Store the value in the variable
+      Builder.CreateStore(CI, Val);
+    }
+    /// Cast the value to int64
+    Value *Casted =
+        Builder.CreateBitCast(Val, Int64Ptr, 
+                              "paramv.val." + Twine(Index) + ".casted");
+    Builder.CreateStore(Casted, ParamVArrayElemPtr);
+  }
 
+  /// Depc is the number of dependencies required for the EDT to run.
+  /// It corresponds to the number of shared variables.
+  int32_t NumDepC = DE.SharedVars.size();
   AllocaInst *DepC = Builder.CreateAlloca(Int32, nullptr, "depc");
-  Builder.CreateStore(ConstantInt::get(Int32, 0), DepC);
+  Builder.CreateStore(ConstantInt::get(Int32, NumDepC), DepC);
+
   /// Insert call to artsEdtCreateWithGuid
-  Function *Func1 = Function::Create(EdtFunction, 
-    GlobalValue::ExternalLinkage, FuncName, M);
+  // Function *EDTFunc = Function::Create(EdtFunction, 
+  //                                      GlobalValue::ExternalLinkage, FuncName, M);
   Value *Args[] = {
-    Builder.CreateBitCast(Func1, EdtFunctionPtr),
+    Builder.CreateBitCast(EDTFunc, EdtFunctionPtr),
     Builder.CreateBitCast(GuidAddr, Int32Ptr),
     Builder.CreateLoad(Int32, ParamC),
-    Builder.CreateBitCast(ParamVAddr, Int64Ptr),
+    Builder.CreateBitCast(ParamVArray, Int64Ptr),
     Builder.CreateLoad(Int32, DepC)
   };
   
   Function *F = getOrCreateRuntimeFunctionPtr(ARTSRTL_artsEdtCreateWithGuid);
   LLVM_DEBUG(dbgs() << TAG <<  "Creating call to artsEdtCreateWithGuid: \n"<< *F << "\n");
   Builder.CreateCall(F, Args);
-  return Func;
+  return nullptr;
 }
 
 /// ---------------------------- Private ---------------------------- ///

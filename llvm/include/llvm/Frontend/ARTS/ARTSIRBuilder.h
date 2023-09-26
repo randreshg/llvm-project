@@ -14,6 +14,8 @@
 #include "llvm/Support/Allocator.h"
 #include "llvm/Frontend/ARTS/ARTSConstants.h"
 
+#include "llvm/Transforms/ARTS/ARTSTransform.h"
+
 namespace llvm {
 // class ARTSIRBuilder;
 
@@ -48,7 +50,16 @@ public:
   Function *getOrCreateRuntimeFunctionPtr(arts::RuntimeFunction FnID);
 
   /// Interface to add ARTS methods
-  Function *createEDT(StringRef FuncName);
+
+  /// Creates EDT Function. It creates an empty function with the
+  /// correct signature and returns it.
+  Function *createEDT(StringRef Name);
+
+  /// Initializes EDT Function. It inserts the call to the
+  /// runtime function to reserve the GUID for the EDT, then it calls 
+  /// artsEdtCreateWithGuid to create the EDT. 
+  Function *initializeEDT(EDTInfo &EDTI, Function *EDTFunc,
+                          BasicBlock *curBB = nullptr);
   AllocaInst *reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node);
 
   /// Declarations for LLVM-IR types (simple, array, function and structure) are

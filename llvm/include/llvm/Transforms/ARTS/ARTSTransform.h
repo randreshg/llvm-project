@@ -1,8 +1,10 @@
 #ifndef LLVM_TRANSFORMS_ARTS_H
 #define LLVM_TRANSFORMS_ARTS_H
 
-#include "llvm/IR/PassManager.h"
 #include "llvm/Transforms/IPO/Attributor.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/IR/PassManager.h"
 
 namespace llvm {
 
@@ -17,18 +19,20 @@ enum RTFunction {
   SET_NUM_THREADS
 };
 
+
 /// ---------------------------- DATA ENVIRONMENT ---------------------------- ///
 /// Struct to store information about the data environment of the OpenMP regions
+
 struct DataEnv {
   /// ---------------------------- Interface ---------------------------- ///
   DataEnv() : RTF(OTHER), CB(nullptr), F(nullptr) {};
-  DataEnv(DataEnv &DE) : RTF(DE.RTF), CB(DE.CB), F(F) {};
+  DataEnv(DataEnv &DE) : RTF(DE.RTF), CB(DE.CB), F(DE.F) {};
   DataEnv(RTFunction RTF, CallBase *CB) 
     : RTF(RTF), CB(CB), F(nullptr) {};
   DataEnv(RTFunction RTF, CallBase *CB, Function *F) 
     : RTF(RTF), CB(CB), F(F) {};
 
-  void append(DataEnv &DE) {
+  void append(const DataEnv &DE) {
     if(DE.RTF != RTF || DE.CB != CB)
       return;
     if(DE.F && !F)
@@ -39,19 +43,26 @@ struct DataEnv {
     LastprivateVars.append(DE.LastprivateVars.begin(), DE.LastprivateVars.end());
   };
 
-  StringRef getCBName() {
+  void clamp(const DataEnv &DE) {
+    RTF = DE.RTF;
+    CB = DE.CB;
+    F = DE.F;
+    append(DE);
+  };
+
+  const StringRef getCBName() const {
     if(CB)
       return CB->getCalledFunction()->getName();
     return "";
   }
 
-  StringRef getFName() {
+  const StringRef getFName() const {
     if(F)
       return F->getName();
     return "";
   }
 
-  Function *getCBFunction() {
+  const Function *getCBFunction() const {
     if(CB)
       return CB->getCalledFunction();
     return nullptr;
@@ -67,45 +78,99 @@ struct DataEnv {
   SmallVector<Value *, 4> LastprivateVars;
 };
 
+inline raw_ostream &operator<<(raw_ostream &OS, DataEnv &DE) {
+    OS << "Data environment for " << DE.getCBName() << "\n";
+    OS << "Firstprivate: " << DE.FirstprivateVars.size() << "\n";
+    for(auto *V : DE.FirstprivateVars)
+      OS << "  - " << *V << "\n";
+    OS << "Private: " << DE.PrivateVars.size() << "\n";
+    for(auto *V : DE.PrivateVars)
+      OS << "  - " << *V << "\n";
+    OS << "Shared: " << DE.SharedVars.size() << "\n";
+    for(auto *V : DE.SharedVars)
+      OS << "  - " << *V << "\n";
+    OS << "Lastprivate: " << DE.LastprivateVars.size() << "\n";
+    for(auto *V : DE.LastprivateVars)
+      OS << "  - " << *V << "\n";
+    OS << "\n";
+    return OS;
+  }
+
+/// ---------------------------- SIGNAL INFO ---------------------------- ///
+struct EDTInfo;
+struct SignalInfo {
+  /// ---------------------------- Interface ---------------------------- ///
+  // SignalInfo() : F(nullptr), CB(nullptr) {};
+  // SignalInfo(Function *F, CallBase *CB) : F(F), CB(CB) {};
+  // SignalInfo(RTFunction RTF, CallBase *CB) 
+  //   : F(nullptr), CB(CB) {};
+  /// ---------------------------- Attributes ---------------------------- ///
+  Value *v;            // Value to signal
+  EDTInfo *EDTI;       // EDT where the value will be signaled to
+};
+
 /// ---------------------------- EDT INFO ---------------------------- ///
 /// Struct to store information about EDTs
 struct EDTInfo {
   /// ---------------------------- Interface ---------------------------- ///
   EDTInfo() : F(nullptr) {};
   EDTInfo(Function *F, DataEnv DE) : F(F), DE(DE) {};
-  EDTInfo(RTFunction RTF, Function *F) : F(nullptr), DE(RTF, F) {};
+  EDTInfo(RTFunction DE_RTF, CallBase *DE_CB) 
+    : F(nullptr), DE(DE_RTF, DE_CB) {};
   /// ---------------------------- Attributes ---------------------------- ///
-  Function *F;
-  DataEnv DE;
+  uint64_t GUID;            // GUID of the EDT
+  Function *F;              // Pointer to the EDT function
+  DataEnv DE;               // Data environment of the EDT
+  SmallVector<SignalInfo*, 4> signal;
 };
 
 /// ---------------------------- ARTS TRANSFORM ---------------------------- ///
 struct ARTSTransformer {
   /// ---------------------------- Interface ---------------------------- ///
-  ARTSTransformer(Module &M, SetVector<Function *> &Functions) 
-                : M(M), Functions(Functions) {}
+  ARTSTransformer(Module &M) : M(M) {}
+  ~ARTSTransformer() {
+    /// Delete EDTs
+    for (const auto &It : EDTInitRegions)
+      delete (It.second);
+    EDTInitRegions.clear();
+  }
   bool run(Attributor &A);
   bool runAttributor(Attributor &A);
 
+
   /// Return the EDT info for a given BB or `nullptr` if there are
   /// none.
-  const EDTInfo *getEDTInfo(BasicBlock &BB) const {
-    auto I = EDTRegions.find(&BB);
-    if (I != EDTRegions.end())
-      return &(I->second.get());
+  EDTInfo *getEDTInfo(BasicBlock &BB) {
+    auto It = EDTInitRegions.find(&BB);
+    if (It != EDTInitRegions.end())
+      return (It->second);
     return nullptr;
   }
 
-private:
-  bool identifyEDTRegions();
+  /// Insert a new EDT info for a given BB and remove the old one if
+  /// there was one.
+  void insertEDTInitRegion(BasicBlock *BB, EDTInfo *EDTI) {
+    auto It = EDTInitRegions.find(BB);
+    if (It != EDTInitRegions.end())
+      delete (It->second);
+    EDTInitRegions.insert(std::make_pair(BB, EDTI));
+  }
+
+  void insertEDTInitRegion(BasicBlock *BB, EDTInfo EDTI) {
+    insertEDTInitRegion(BB, new EDTInfo(EDTI));
+  }
+
+  void insertEDTInitRegion(BasicBlock *BB, RTFunction DE_RTF, CallBase *DE_CB) {
+    insertEDTInitRegion(BB, new EDTInfo(DE_RTF, DE_CB));
+  }
 
   /// ---------------------------- Attributes ---------------------------- ///
   /// The underlying module.
   Module &M;
   /// Set of valid functions in the module.
-  SetVector<Function *> &Functions;
+  // SetVector<Function *> &Functions;
   /// EDT Regions
-  DenseMap<BasicBlock *, EDTInfo > EDTRegions;
+  DenseMap<BasicBlock *, EDTInfo *> EDTInitRegions;
 };
 
 /// ---------------------------- ARTS TRANSFORM PASS ---------------------------- ///
