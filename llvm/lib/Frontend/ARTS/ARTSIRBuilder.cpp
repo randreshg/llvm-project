@@ -151,7 +151,7 @@ Function *ARTSIRBuilder::createEDT(StringRef Name) {
 
 Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBlock *CurBB) {
   auto &DE = EI.DE;
-  LLVM_DEBUG(dbgs() << TAG <<  "Creating EDT for " << DE.getCBName() << "\n");
+  LLVM_DEBUG(dbgs() << TAG <<  "Creating EDT \n");
   /// Get CurBB parent
   Function *Func = CurBB->getParent();
   LLVM_DEBUG(dbgs() << TAG <<  "CurBB parent: " << Func->getName() << "\n");
