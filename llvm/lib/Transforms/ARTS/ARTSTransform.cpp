@@ -160,7 +160,13 @@ struct AADataEnvFunction : AADataEnv {
     return true;
   }
 
+  ChangeStatus returnPessimisticFixpoint() {
+    indicatePessimisticFixpoint();
+    return ChangeStatus::CHANGED;
+  }
+
   ChangeStatus updateImpl(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
     Function &F = cast<Function>(getAnchorValue());
     LLVM_DEBUG(dbgs() << "[AADataEnvFunction] updateImpl: "
                       << F.getName() << "\n");
@@ -168,308 +174,34 @@ struct AADataEnvFunction : AADataEnv {
     auto &AIC = static_cast<ARTSInformationCache &>(A.getInfoCache());
     auto &AT = AIC.ARTSTransform;
     /// Get MemorySSA
-    MemorySSA &MSSA = AIC.AG.getAnalysis<MemorySSAAnalysis>(F)->getMSSA();
-    MemorySSAWalker *Walker = MSSA.getWalker();
-    MSSA.dump();
-
-    auto MDA = AIC.AG.getAnalysis<MemoryDependenceAnalysis>(F);
-    /// Function's EDT
-    // EDTInfo *ParentEDT = AT.getEDTForFunction(&F);
-  //   auto checkAndAddValue = [&](Value *Val, EDTInfo *EDT) {
-  //     // Type *ValType = Val->getType();
-  //     LLVM_DEBUG(dbgs() << "  - Operand: " << *Val << "\n");
-  //     // LLVM_DEBUG(dbgs() << "    - Operand type: " << *ValType << "\n");
-  //     if(isa<Argument>(Val)) {
-  //       // LLVM_DEBUG(dbgs() << "    - It is an Argument\n");
-  //       return;
-  //     }
-  //     auto *ValInst = dyn_cast<Instruction>(Val);
-  //     if(!ValInst) {
-  //       /// It can be a constant value...
-  //       // LLVM_DEBUG(dbgs() << "    - It is not an Instruction\n");
-  //       return false;
-  //     }
-  //     // /// It is also important to consider global variables
-  //     // if(auto *GV = dyn_cast<GlobalVariable>(ValInst))
-  //     /// Check if the instruction is in the same EDT Data scope
-  //     // LLVM_DEBUG(dbgs() << "    - It is an Instruction\n");
-  //     auto *EB = AT.getEDTBlock(ValInst->getParent());
-  //     EB->Analyzed = true;
-  //     if(EB->EDT->ID == EDT->ID) {
-  //       LLVM_DEBUG(dbgs() << "    - It is in the same EDT\n");
-  //       return;
-  //     }
-  //     LLVM_DEBUG(dbgs() << "    - It is not in the same EDT\n");
-  //     EDT->ExternalValues.insert(ValInst);
-  // };
-
-    const std::function<bool(EDTBlock *CurrentEB, Instruction &I)> handleInstruction = 
-      [&](EDTBlock *CurrentEB, Instruction &I) {
-      LLVM_DEBUG(dbgs() << "  - Handling instruction:\n");
-      // LLVM_DEBUG(dbgs() << "  - Memory access: " << *MSSA.getMemoryAccess(&I) << "\n");
-      // LLVM_DEBUG(dbgs() << "  - Memory instruction: " << *Walker->getClobberingMemoryAccess(&I) << "\n");
-      SmallVector<MemoryAccess *> WorkList{Walker->getClobberingMemoryAccess(&I)};
-      SmallSet<MemoryAccess *, 8> Visited;
-      /// Get clobbering access. If the memory instruction of the access is
-      /// inside the same EDT, we ignore it
-      while (!WorkList.empty()) {
-        MemoryAccess *MA = WorkList.pop_back_val();
-        if (!Visited.insert(MA).second)
-          continue;
-        /// If it is a live on entry def, we dont care about it.
-        if (MSSA.isLiveOnEntryDef(MA)) {
-          LLVM_DEBUG(dbgs() << "    - It is a live on entry\n");
-          continue;
-        }
-
-        if (MemoryDef *Def = dyn_cast<MemoryDef>(MA)) {
-          Instruction *DefInst = Def->getMemoryInst();
-          LLVM_DEBUG(dbgs() << "  - Def: " << *DefInst << '\n');
-          auto *ClobberEB = AT.getEDTBlock(DefInst);
-          bool isInitBlock = ClobberEB->isInit();
-          /// If the clobbering access is inside the same EDT, we ignore it
-          if(ClobberEB->isInSameEDT(*CurrentEB)) {
-            LLVM_DEBUG(dbgs() << "    - Clobbering access is in the same EDT\n");
-            /// Continue looking for clobbering access
-            // WorkList.push_back(
-            //   Walker->getClobberingMemoryAccess(Def->getDefiningAccess(), Loc));
-            continue;
-          }
-
-          LLVM_DEBUG(dbgs() << "    - Clobbering access is not in the same EDT\n");
-          /// Iterate through the operands of the instruction
-          for (Use &U : DefInst->operands()) {
-            Value *Val = U.get();
-            /// If it not an instruction, we ignore it
-            auto *ValInst = dyn_cast<Instruction>(Val);
-            if(!ValInst) {
-              /// It can be a constant value, or an argument...
-              continue;
-            }
-            LLVM_DEBUG(dbgs() << "    - Use: " << *ValInst << '\n');
-            EDTBlock *ValEB = AT.getEDTBlock(ValInst);
-            /// Ignore uses in the same block
-            if(ValEB->isInSameEDT(*CurrentEB))
-              continue;
-            /// If ClobberEDTBlock is an init block, we need to determine
-            /// if the value is a shared variable. If not, it is not a clobbering
-            /// access. For now return true.
-            if(isInitBlock) {
-              /// Is it a shared variable?
-              /// Signal value
-              // return true;
-              LLVM_DEBUG(dbgs() << "      - Clobbering access is an init block\n");
-            }
-            /// Get memory access
-            auto *ValMA = MSSA.getMemoryAccess(ValInst);
-            if(ValMA && isa<MemoryUse>(ValMA)) {
-              /// If it is a memory use, we can ignore it. 
-              /// Memory uses will be handled when we analyze the clobbering
-              continue;
-            }
-            /// Get underlying object of the instruction
-            auto *ValObj = getUnderlyingObject(Val);
-            /// For now, let's print the underlying object
-            LLVM_DEBUG(dbgs() << "      - Underlying object: " << *ValObj << "\n");
-            // ValMA = MSSA.getMemoryAccess(ValObj);
-            // if(MemoryDef *Def = dyn_cast<MemoryDef>(ValMA)) {
-            //   /// If it is a memory def, we can ignore it
-            //   continue;
-            // }
-
-
-
-            /// If it not an instruction, we ignore it
-            // auto *ValInst = dyn_cast<Instruction>(v);
-            // if(!ValInst) {
-            //   /// It can be a constant value, or an argument...
-            //   continue;
-            // }
-            // /// Check if the instruction is in the same EDT Data scope
-            // auto *EB = AT.getEDTBlock(ValInst->getParent());
-            // /// Is it a memory access?
-            // auto *ValMA = MSSA.getMemoryAccess(ValInst);
-            // if(!ValMA) {
-            //   /// It is not a memory access, so we ignore it
-            //   continue;
-            // }
-            // ...
-          }
-          /// If ClobberEB is an init block, we need to determine if the value
-          /// is a shared variable. If it is, ClobberEB needs to signal the value
-          /// to the CurrentEB. 
-          
-
-          for (auto &U : Def->uses()) {
-            MemoryAccess *MA = cast<MemoryAccess>(U.getUser());
-            LLVM_DEBUG(dbgs() << "  - Use: " << *MA << '\n');
-
-            /// Get all uses of the memory access
-            // for (auto &Use : MA->uses()) {
-
-            /// If the use is in the same EDT block, we ignore it
-
-
-
-            // if (auto *MU = cast_of_null<MemoryUse>MA) {
-            //   // Process MemoryUse as needed.
-            // }
-            // else {
-            //   // Process MemoryDef or MemoryPhi as needed.
-
-            //   // As a user can come up twice, as an optimized access and defining
-            //   // access, keep a visited list.
-
-            //   // Check transitive uses as needed
-            //   checkUses (MA); // use a worklist for an iterative algorithm
-            // }
-          }
-          // Block numbering starts at 1.
-          // unsigned long LastNumber = 0;
-          // for(const MemoryAccess &MA : *(MSSA.getBlockAccesses(ClobberBB))) {
-            
-          // }
-
-          return true;
-        }
-
-        const MemoryPhi *Phi = cast<MemoryPhi>(MA);
-        for (const auto &Use : Phi->incoming_values())
-          WorkList.push_back(cast<MemoryAccess>(&Use));
-        // if(!MA) {
-        //   LLVM_DEBUG(dbgs() << "  - No memory access\n");
-        //   return false;
-        //   // auto *ValInst = dyn_cast<Instruction>(Val);
-        //   // if(!ValInst) {
-        //   //   /// It can be a constant value, or an argument...
-        //   //   return false;
-        //   // }
-        // }
-        // auto *CA = Walker->getClobberingMemoryAccess(MA);
-        // if(!CA) {
-        //   LLVM_DEBUG(dbgs() << "  - No clobbering access\n");
-        //   return false;
-        // }
-        // LLVM_DEBUG(dbgs() << "  - Clobbering access: " << *CA << "\n");
-        // /// If it is a live on entry def, we dont care about it.
-        // if (MSSA.isLiveOnEntryDef(CA)) {
-        //   LLVM_DEBUG(dbgs() << "  - It is a live on entry\n");
-        //   return false;
-        // }
-        // /// Get the EDT block of the memory instruction of the clobbering access
-        // MemoryUseOrDef *CMA = dyn_cast<MemoryUseOrDef>(CA);
-        // Instruction *CInst = CMA->getMemoryInst();
-        // auto *ClobberEB = AT.getEDTBlock(CInst->getParent());
-        // /// If the clobbering access is inside the same EDT, we ignore it
-        // if(ClobberEB->isInSameEDT(*CurrentEB)) {
-        //   LLVM_DEBUG(dbgs() << "  - Clobbering access is in the same EDT\n");
-        //   return false;
-        // }
-        // else {
-        //   LLVM_DEBUG(dbgs() << "  - Clobbering access is in a different EDT\n");
-        /// Now we have to identify the external values. We do this by checking
-        /// the operands of the instruction. If the operand is a constant, we 
-        /// ignore it. If it is
-        /// a global variable, we add it to the external values of the EDT.
-    
-        /// If ClobberEB is an init block, we need to determine if the value
-        /// is a shared variable. If it is, ClobberEB needs to signal the value
-        /// to the CurrentEB. 
-
-
-        /// Iterate through the arguments of the CallBase
-        /// the values that are used in the init block. For this, we need to
-        // if(auto *CB = dyn_cast<CallBase>(I)) {
-        //   for(auto &arg : CB->args()) {
-        //     handleInstruction(CurrentEB, *CB);
-        //     // checkAndAddValue(arg, EDT);
-        //   }
-        //   return true;
-        // }
-        // /// Iterate through the operands of the instruction
-        // for(unsigned int i = 0; i < I->getNumOperands(); i++)
-        //   checkAndAddValue(I->getOperand(i), EDT);
-        // // LLVM_DEBUG(dbgs() << "\n");
-      }
-      return true;
-    };
-
-    LLVM_DEBUG(dbgs() << "[AADataEnvFunction] Checking read/write instructions\n");
-    /// Callback to check a read/write instruction.
-    /// It first verifies if the instruction belongs to an EDT Block, if it
-    /// does it adds it to the RWInsts vector of the EDT. 
-    /// Then it finds the memory access and analyzes its corresponding 
-    /// clobbering access. It the clobbering access is not in the same EDT, it
-    /// Analyzes the operands of the instruction to identify the external values,
-    /// and fills out the DependentValues vector of the EDT.
-    auto CheckRWInst = [&](Instruction &I) {
-      LLVM_DEBUG(dbgs() << "Checking "<< I <<"\n");
-      auto *CurrentBB = I.getParent();
-      /// Ignore lifetime start/end instructions
-      if(I.isLifetimeStartOrEnd())
-        return true;
+    // MemorySSA &MSSA = AIC.AG.getAnalysis<MemorySSAAnalysis>(F)->getMSSA();
+    // MemorySSAWalker *Walker = MSSA.getWalker();
+    // MSSA.dump();
+    auto *LivenessAA =
+      A.getAAFor<AAIsDead>(*this, getIRPosition(), DepClassTy::OPTIONAL);
+    /// Iterate through the R/W instructions of the function
+    for(auto *I: AT.getRWInsts(&F)) {
       /// Get the EDT block of the instruction
-      EDTBlock *CurrentEB = AT.getEDTBlock(CurrentBB);
-      if(!CurrentEB) {
-        LLVM_DEBUG(dbgs() << "[AADataEnvFunction] BB parent: " 
-                          << CurrentBB->getName() << "\n");
-        LLVM_DEBUG(dbgs() << "[AADataEnvFunction] BB is not an EDT region\n");
-        indicatePessimisticFixpoint();
-        return false;
-      }
-      /// Handle EDT init block
-      if(CurrentEB->Type == EDTBlock::INIT) 
-        return handleEDTInitBlock(A, I, *CurrentEB);
-      /// Add the instruction to the RWInsts vector
-      CurrentEB->EDT->RWInsts.insert(&I);
-      /// Analyze memory dependencies
-      MemDepResult DepRes = MDA->getDependency(&I);
-      Instruction *DepInst = DepRes.getInst();
-      if(!DepInst) {
-        if(DepRes.isUnknown()) {
-          LLVM_DEBUG(dbgs() << "  - Dependency is unknown\n");
-        }
-        if(DepRes.isNonLocal()) {
-          LLVM_DEBUG(dbgs() << "  - Non local dependency\n");
-          /// If it is a load instruction, get operand
-          if(auto *LI = dyn_cast<LoadInst>(&I)) {
-            Value *UnderlyingObj = getUnderlyingObject(LI->getPointerOperand());
-            LLVM_DEBUG(dbgs() << "  - Underlying object: " << *UnderlyingObj << "\n");
-          }
-          else {
-            Value *UnderlyingObj = getUnderlyingObject(&I);
-            LLVM_DEBUG(dbgs() << "  - Underlying object: " << *UnderlyingObj << "\n");
-          }
-        }
-        
-
-        // LLVM_DEBUG(dbgs() << "  - No memory instruction\n");
-        return true;
-      }
-      LLVM_DEBUG(dbgs() << "  - Memory dependency: " << *DepRes.getInst() << "\n");
-      if(!DepRes.isDef()) {
-        LLVM_DEBUG(dbgs() << "    - Dep is not a memory definition\n");
-        return true;
-      }
-      // if (DepRes.isUnknown() || !DepRes.getInst()) {
-      //   LLVM_DEBUG(dbgs() << "  - No memory access\n");
-      //   return true;
-      // }
-      
-      // Handle instruction
-      // handleInstruction(CurrentEB, I);
-
-      return true;
-    };
+      EDTBlock *CurrentEB = AT.getEDTBlock(I);
+      if(!CurrentEB)
+        return returnPessimisticFixpoint();
   
-    /// Call CheckRWInst for all instructions that may read or write
-    /// in the function
-    bool UsedAssumedInformationInCheckRWInst = false;
-    if (!A.checkForAllReadWriteInstructions(
-            CheckRWInst, *this, UsedAssumedInformationInCheckRWInst)) {
-      LLVM_DEBUG(dbgs() << "  - checkForAllReadWriteInstructions failed\n");
-      return ChangeStatus::UNCHANGED;
+      /// Handle EDT init block
+      if(CurrentEB->isInit()) {
+        /// If the EDT init block could not be handled, it can be because
+        /// it is still not at fixpoint.
+        if(!handleEDTInitBlock(A, *I, *CurrentEB))
+          return ChangeStatus::UNCHANGED;
+      }
+      /// Add the instruction to the RWInsts vector
+      CurrentEB->insertRWInst(&I);
+      /// Now we check if the instruction is assumed dead
+      if (A.isAssumedDead(I, *this, LivenessAA, UsedAssumedInformation,
+                          /* CheckBBLivenessOnly */ true, DepClassTy::OPTIONAL,
+                          /* CheckForDeadStore */ true))
+
     }
+
     indicateOptimisticFixpoint();
     return ChangeStatus::CHANGED;
   }
