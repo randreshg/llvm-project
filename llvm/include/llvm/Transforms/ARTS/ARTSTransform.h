@@ -143,7 +143,6 @@ struct OMPInfo {
 
 /// ---------------------------- EDT DEP ---------------------------- ///
 struct EDTInfo;
-
 struct EDTDep {
   /// ---------------------------- Interface ---------------------------- ///
   EDTDep() : EDT(nullptr) {};
@@ -172,17 +171,18 @@ struct EDTBlock {
           : EDT(EDT), Type(Type), BB(BB) {};
   EDTBlock(EDTBlock &B) 
           : EDT(B.EDT), Type(B.Type), BB(B.BB) {};
-  /// Overwrite = operator
-  // EDTBlock &operator=(const EDTBlock &B) {
-  //   EDT = B.EDT;
-  //   Type = B.Type;
-  //   BB = B.BB;
-  //   return *this;
-  // }
 
   void setOMPInfo(OMPInfo &OMPI) {
     HasOMP = true;
     OMP = OMPI;
+  }
+
+  bool isInSameEDT(EDTBlock &B) {
+    return (EDT == B.EDT);
+  }
+
+  bool isInit() {
+    return (Type == INIT);
   }
 
   /// ---------------------------- Attributes ---------------------------- ///
@@ -220,7 +220,8 @@ inline raw_ostream &operator<<(raw_ostream &OS, EDTBlock &EB) {
   OS << "\n";
   auto HasOMP = EB.HasOMP ? "True" : "False";
   OS << "  - OMP: " << HasOMP << "\n";
-  OS << "  - Transformed: " << Transformed << "\n";
+  OS << "  - Transformed: " << Transformed;
+  OS << *EB.BB;
   return OS;
 }
 
@@ -228,7 +229,7 @@ inline raw_ostream &operator<<(raw_ostream &OS, EDTBlock &EB) {
 /// Struct to store information about EDTs
 struct EDTInfo {
   /// ---------------------------- Interface ---------------------------- ///
-  EDTInfo(uint64_t ID) : ID(ID), F(nullptr) {};
+  EDTInfo(uint64_t ID) : ID(ID) {};
   EDTInfo(uint64_t ID, Function *F, DataEnv DE) 
         : ID(ID), F(F), DE(DE) {};
 
@@ -252,18 +253,20 @@ struct EDTInfo {
   /// GUID of the EDT
   uint64_t ID;
   /// Pointer to the EDT function
-  Function *F;
+  Function *F = nullptr;
   /// Data environment of the EDT
   DataEnv DE;
   /// Init EDTBlock
   EDTBlock *Init = nullptr;
+  /// Indicates if the EDT was analyzed or not
+  bool Analyzed = false;
   /// List of EDT Dependencies - successors
   SmallPtrSet<EDTDep *, 4> Deps;
   /// List of BasicBlocks that are part of the EDT
   SmallPtrSet<EDTBlock *, 4> Blocks;
   /// Set of instructions that may read or write to memory
   SmallPtrSet<Instruction *, 4> RWInsts;
-  /// Set of values not declared in the EDT
+  /// Set of used instructions with values not declared in the EDT
   SmallPtrSet<Instruction *, 4> ExternalValues;
 };
 
@@ -276,7 +279,11 @@ inline raw_ostream &operator<<(raw_ostream &OS, EDTInfo &EI) {
   }
   OS << "Number of RWInsts: " << EI.RWInsts.size() << "\n";
   for(auto *I : EI.RWInsts) {
-    OS << "  - " << *I << "\n";
+    // OS << "  - " << I << "\n";
+    // if(auto *CB = dyn_cast<CallBase>(I))
+    //   OS << "  - " << CB->getCalledFunction()->getName() << "\n";
+    // else
+      OS << "  - " << *I << "\n";
   }
   OS << "Number of ExternalValues: " << EI.ExternalValues.size() << "\n";
   for(auto *I : EI.ExternalValues) {
@@ -304,29 +311,22 @@ struct ARTSTransformer {
 
   /// ---------------------------- Helper Functions ---------------------------- ///
   /// Insert EDT
-  EDTInfo *insertEDT(Function *F) {
+  EDTInfo *insertEDT(Function *F, EDTBlock *Init = nullptr) {
     EDTInfo *EDTI = new EDTInfo(EDTID++);
+    if(Init) {
+      assert(Init->Type == EDTBlock::BlockType::INIT 
+             && "Init block must be of type INIT");
+      EDTI->Init = Init;
+    }
     EDTs.insert(EDTI);
     EDTsFromFunction[F].insert(EDTI);
     return EDTI;
   }
 
-  /// Insert EDT and add dependency. 
-  /// Creates a new EDT and adds a dependency from the given EDT to the new one.
-  EDTInfo *insertEDTWithDep(EDTInfo *From, Function *F) {
-    EDTInfo *EDTI = insertEDT(F);
+  void insertDep(EDTInfo *From, EDTInfo *To) {
     /// Create dependency
-    EDTDep *SI = new EDTDep(EDTI);
+    EDTDep *SI = new EDTDep(To);
     From->addDep(SI);
-    /// Return new EDT
-    return EDTI;
-  }
-
-  /// Insert EDT, add dependency and init EDTBlock.
-  EDTInfo *insertEDTWithDep(EDTInfo *From, EDTBlock *Init) {
-    EDTInfo *EDTI = insertEDTWithDep(From, Init->BB->getParent());
-    EDTI->Init = Init;
-    return EDTI;
   }
 
   /// ---------------------------- EDTBlock Map ---------------------------- ///
@@ -337,6 +337,10 @@ struct ARTSTransformer {
     if (It != EDTBlocks.end())
       return (It->second);
     return nullptr;
+  }
+
+  EDTBlock *getEDTBlock(Instruction *I) {
+    return getEDTBlock(I->getParent());
   }
 
   /// Create EDTBlock and insert it into the EDT and map
@@ -361,6 +365,24 @@ struct ARTSTransformer {
     return EDTB;
   }
 
+  /// Get EDT for function
+  EDTInfo *getEDTForFunction(Function *F) {
+    auto It = EDTForFunction.find(F);
+    if (It != EDTForFunction.end())
+      return It->second;
+    return nullptr;
+  }
+
+  /// Insert EDT for function
+  void insertEDTForFunction(Function *F, EDTInfo *EDTI) {
+    EDTForFunction.insert(std::make_pair(F, EDTI));
+  }
+
+  /// ---------------------------- EDTBlock Map ---------------------------- ///
+  void insertRWInst(Function *F, Instruction *I) {
+    RWInsts[F].insert(I);
+  }
+
   /// ---------------------------- Attributes ---------------------------- ///
   /// The underlying module.
   Module &M;
@@ -369,11 +391,19 @@ struct ARTSTransformer {
   /// List of EDTs
   uint64_t EDTID = 0;
   SmallPtrSet<EDTInfo *, 4> EDTs;
-  /// Maps a function to the set of EDTs that were created from it
-  DenseMap<Function *, SmallPtrSet<EDTInfo *, 4>> EDTsFromFunction;
   /// Maps the basic block to the EDT Block
   DenseMap<BasicBlock *, EDTBlock *> EDTBlocks;
-  /// 
+  /// Maps a function to the set of EDTs that were created from it.
+  /// For example, if inside the main function there is a parallel region
+  /// 2 EDTs will be created from it: one for the parallel region and one for
+  /// the outlined function.
+  DenseMap<Function *, SmallPtrSet<EDTInfo *, 4>> EDTsFromFunction;
+  /// Maps a function to the EDT that represents it.
+  /// There are EDTs that represent the same function. This map is used to
+  /// identify them.
+  DenseMap<Function *, EDTInfo *> EDTForFunction;
+  /// Maps a function to set the instructions that may read or write to memory
+  DenseMap<Function *, SmallPtrSet<Instruction *, 4>> RWInsts;
 };
 
 inline raw_ostream &operator<<

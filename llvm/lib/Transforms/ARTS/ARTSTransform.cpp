@@ -2,8 +2,10 @@
 #include "llvm/Transforms/ARTS/ARTSTransform.h"
 #include "llvm/Frontend/ARTS/ARTSIRBuilder.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
+#include "llvm/Analysis/ValueTracking.h"
 
 #include "llvm/Support/Debug.h"
 #include "llvm/IR/BasicBlock.h"
@@ -32,8 +34,6 @@ static cl::opt<bool> PrintModuleAfterOptimizations(
     "arts-print-module-after",
     cl::desc("Print the module after the ARTSTransformer Module Pass"),
     cl::Hidden, cl::init(false));
-
-/// ---------------------------- UTILS ---------------------------- ///
 
 
 /// ---------------------------- ABSTRACT ATTRIBUTES ---------------------------- ///
@@ -109,7 +109,7 @@ struct AADataEnvBasicBlock : AADataEnv {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
     LLVM_DEBUG(dbgs() << "[AADataEnvBasicBlock] updateImpl\n");
     // BasicBlock &BB = cast<BasicBlock>(getAnchorValue());
-    return ChangeStatus::UNCHANGED;
+    return Changed;
   }
 
   ChangeStatus manifest(Attributor &A) override {
@@ -137,10 +137,9 @@ struct AADataEnvFunction : AADataEnv {
     /// Let's handle the rest in the updateImpl function
   }
 
-  bool handleEDTInitBlock(Attributor &A, EDTBlock &EB) {
-    LLVM_DEBUG(dbgs() << "[AADataEnvFunction] EDT init block - FOUND\n");
-    LLVM_DEBUG(dbgs() << "  - EDT callbase: " << EB.OMP.getCBName() << "\n");
-    /// Check 
+  bool handleEDTInitBlock(Attributor &A, Instruction &I, EDTBlock &EB) {
+    LLVM_DEBUG(dbgs() << "[AADataEnvFunction] EDT init block: " 
+                      << EB.OMP.getCBName() << "\n");
     auto *DEAA = A.getAAFor<AADataEnv>(
       *this, IRPosition::callsite_function(*EB.OMP.CB), DepClassTy::OPTIONAL);
     /// Check if the DEAA is valid
@@ -153,6 +152,11 @@ struct AADataEnvFunction : AADataEnv {
       LLVM_DEBUG(dbgs() <<"[AADataEnvFunction] DEAA is not at fixpoint\n");
       return false;
     }
+    /// Only add the call to the RT function if init block.
+    if(!EB.Analyzed) {
+      EB.EDT->RWInsts.insert(&I);
+      EB.Analyzed = true;
+    }
     return true;
   }
 
@@ -160,25 +164,301 @@ struct AADataEnvFunction : AADataEnv {
     Function &F = cast<Function>(getAnchorValue());
     LLVM_DEBUG(dbgs() << "[AADataEnvFunction] updateImpl: "
                       << F.getName() << "\n");
-
+    /// Get cache
     auto &AIC = static_cast<ARTSInformationCache &>(A.getInfoCache());
+    auto &AT = AIC.ARTSTransform;
+    /// Get MemorySSA
+    MemorySSA &MSSA = AIC.AG.getAnalysis<MemorySSAAnalysis>(F)->getMSSA();
+    MemorySSAWalker *Walker = MSSA.getWalker();
+    MSSA.dump();
 
-    // Callback to check a read/write instruction.
+    auto MDA = AIC.AG.getAnalysis<MemoryDependenceAnalysis>(F);
+    /// Function's EDT
+    // EDTInfo *ParentEDT = AT.getEDTForFunction(&F);
+  //   auto checkAndAddValue = [&](Value *Val, EDTInfo *EDT) {
+  //     // Type *ValType = Val->getType();
+  //     LLVM_DEBUG(dbgs() << "  - Operand: " << *Val << "\n");
+  //     // LLVM_DEBUG(dbgs() << "    - Operand type: " << *ValType << "\n");
+  //     if(isa<Argument>(Val)) {
+  //       // LLVM_DEBUG(dbgs() << "    - It is an Argument\n");
+  //       return;
+  //     }
+  //     auto *ValInst = dyn_cast<Instruction>(Val);
+  //     if(!ValInst) {
+  //       /// It can be a constant value...
+  //       // LLVM_DEBUG(dbgs() << "    - It is not an Instruction\n");
+  //       return false;
+  //     }
+  //     // /// It is also important to consider global variables
+  //     // if(auto *GV = dyn_cast<GlobalVariable>(ValInst))
+  //     /// Check if the instruction is in the same EDT Data scope
+  //     // LLVM_DEBUG(dbgs() << "    - It is an Instruction\n");
+  //     auto *EB = AT.getEDTBlock(ValInst->getParent());
+  //     EB->Analyzed = true;
+  //     if(EB->EDT->ID == EDT->ID) {
+  //       LLVM_DEBUG(dbgs() << "    - It is in the same EDT\n");
+  //       return;
+  //     }
+  //     LLVM_DEBUG(dbgs() << "    - It is not in the same EDT\n");
+  //     EDT->ExternalValues.insert(ValInst);
+  // };
+
+    const std::function<bool(EDTBlock *CurrentEB, Instruction &I)> handleInstruction = 
+      [&](EDTBlock *CurrentEB, Instruction &I) {
+      LLVM_DEBUG(dbgs() << "  - Handling instruction:\n");
+      // LLVM_DEBUG(dbgs() << "  - Memory access: " << *MSSA.getMemoryAccess(&I) << "\n");
+      // LLVM_DEBUG(dbgs() << "  - Memory instruction: " << *Walker->getClobberingMemoryAccess(&I) << "\n");
+      SmallVector<MemoryAccess *> WorkList{Walker->getClobberingMemoryAccess(&I)};
+      SmallSet<MemoryAccess *, 8> Visited;
+      /// Get clobbering access. If the memory instruction of the access is
+      /// inside the same EDT, we ignore it
+      while (!WorkList.empty()) {
+        MemoryAccess *MA = WorkList.pop_back_val();
+        if (!Visited.insert(MA).second)
+          continue;
+        /// If it is a live on entry def, we dont care about it.
+        if (MSSA.isLiveOnEntryDef(MA)) {
+          LLVM_DEBUG(dbgs() << "    - It is a live on entry\n");
+          continue;
+        }
+
+        if (MemoryDef *Def = dyn_cast<MemoryDef>(MA)) {
+          Instruction *DefInst = Def->getMemoryInst();
+          LLVM_DEBUG(dbgs() << "  - Def: " << *DefInst << '\n');
+          auto *ClobberEB = AT.getEDTBlock(DefInst);
+          bool isInitBlock = ClobberEB->isInit();
+          /// If the clobbering access is inside the same EDT, we ignore it
+          if(ClobberEB->isInSameEDT(*CurrentEB)) {
+            LLVM_DEBUG(dbgs() << "    - Clobbering access is in the same EDT\n");
+            /// Continue looking for clobbering access
+            // WorkList.push_back(
+            //   Walker->getClobberingMemoryAccess(Def->getDefiningAccess(), Loc));
+            continue;
+          }
+
+          LLVM_DEBUG(dbgs() << "    - Clobbering access is not in the same EDT\n");
+          /// Iterate through the operands of the instruction
+          for (Use &U : DefInst->operands()) {
+            Value *Val = U.get();
+            /// If it not an instruction, we ignore it
+            auto *ValInst = dyn_cast<Instruction>(Val);
+            if(!ValInst) {
+              /// It can be a constant value, or an argument...
+              continue;
+            }
+            LLVM_DEBUG(dbgs() << "    - Use: " << *ValInst << '\n');
+            EDTBlock *ValEB = AT.getEDTBlock(ValInst);
+            /// Ignore uses in the same block
+            if(ValEB->isInSameEDT(*CurrentEB))
+              continue;
+            /// If ClobberEDTBlock is an init block, we need to determine
+            /// if the value is a shared variable. If not, it is not a clobbering
+            /// access. For now return true.
+            if(isInitBlock) {
+              /// Is it a shared variable?
+              /// Signal value
+              // return true;
+              LLVM_DEBUG(dbgs() << "      - Clobbering access is an init block\n");
+            }
+            /// Get memory access
+            auto *ValMA = MSSA.getMemoryAccess(ValInst);
+            if(ValMA && isa<MemoryUse>(ValMA)) {
+              /// If it is a memory use, we can ignore it. 
+              /// Memory uses will be handled when we analyze the clobbering
+              continue;
+            }
+            /// Get underlying object of the instruction
+            auto *ValObj = getUnderlyingObject(Val);
+            /// For now, let's print the underlying object
+            LLVM_DEBUG(dbgs() << "      - Underlying object: " << *ValObj << "\n");
+            // ValMA = MSSA.getMemoryAccess(ValObj);
+            // if(MemoryDef *Def = dyn_cast<MemoryDef>(ValMA)) {
+            //   /// If it is a memory def, we can ignore it
+            //   continue;
+            // }
+
+
+
+            /// If it not an instruction, we ignore it
+            // auto *ValInst = dyn_cast<Instruction>(v);
+            // if(!ValInst) {
+            //   /// It can be a constant value, or an argument...
+            //   continue;
+            // }
+            // /// Check if the instruction is in the same EDT Data scope
+            // auto *EB = AT.getEDTBlock(ValInst->getParent());
+            // /// Is it a memory access?
+            // auto *ValMA = MSSA.getMemoryAccess(ValInst);
+            // if(!ValMA) {
+            //   /// It is not a memory access, so we ignore it
+            //   continue;
+            // }
+            // ...
+          }
+          /// If ClobberEB is an init block, we need to determine if the value
+          /// is a shared variable. If it is, ClobberEB needs to signal the value
+          /// to the CurrentEB. 
+          
+
+          for (auto &U : Def->uses()) {
+            MemoryAccess *MA = cast<MemoryAccess>(U.getUser());
+            LLVM_DEBUG(dbgs() << "  - Use: " << *MA << '\n');
+
+            /// Get all uses of the memory access
+            // for (auto &Use : MA->uses()) {
+
+            /// If the use is in the same EDT block, we ignore it
+
+
+
+            // if (auto *MU = cast_of_null<MemoryUse>MA) {
+            //   // Process MemoryUse as needed.
+            // }
+            // else {
+            //   // Process MemoryDef or MemoryPhi as needed.
+
+            //   // As a user can come up twice, as an optimized access and defining
+            //   // access, keep a visited list.
+
+            //   // Check transitive uses as needed
+            //   checkUses (MA); // use a worklist for an iterative algorithm
+            // }
+          }
+          // Block numbering starts at 1.
+          // unsigned long LastNumber = 0;
+          // for(const MemoryAccess &MA : *(MSSA.getBlockAccesses(ClobberBB))) {
+            
+          // }
+
+          return true;
+        }
+
+        const MemoryPhi *Phi = cast<MemoryPhi>(MA);
+        for (const auto &Use : Phi->incoming_values())
+          WorkList.push_back(cast<MemoryAccess>(&Use));
+        // if(!MA) {
+        //   LLVM_DEBUG(dbgs() << "  - No memory access\n");
+        //   return false;
+        //   // auto *ValInst = dyn_cast<Instruction>(Val);
+        //   // if(!ValInst) {
+        //   //   /// It can be a constant value, or an argument...
+        //   //   return false;
+        //   // }
+        // }
+        // auto *CA = Walker->getClobberingMemoryAccess(MA);
+        // if(!CA) {
+        //   LLVM_DEBUG(dbgs() << "  - No clobbering access\n");
+        //   return false;
+        // }
+        // LLVM_DEBUG(dbgs() << "  - Clobbering access: " << *CA << "\n");
+        // /// If it is a live on entry def, we dont care about it.
+        // if (MSSA.isLiveOnEntryDef(CA)) {
+        //   LLVM_DEBUG(dbgs() << "  - It is a live on entry\n");
+        //   return false;
+        // }
+        // /// Get the EDT block of the memory instruction of the clobbering access
+        // MemoryUseOrDef *CMA = dyn_cast<MemoryUseOrDef>(CA);
+        // Instruction *CInst = CMA->getMemoryInst();
+        // auto *ClobberEB = AT.getEDTBlock(CInst->getParent());
+        // /// If the clobbering access is inside the same EDT, we ignore it
+        // if(ClobberEB->isInSameEDT(*CurrentEB)) {
+        //   LLVM_DEBUG(dbgs() << "  - Clobbering access is in the same EDT\n");
+        //   return false;
+        // }
+        // else {
+        //   LLVM_DEBUG(dbgs() << "  - Clobbering access is in a different EDT\n");
+        /// Now we have to identify the external values. We do this by checking
+        /// the operands of the instruction. If the operand is a constant, we 
+        /// ignore it. If it is
+        /// a global variable, we add it to the external values of the EDT.
+    
+        /// If ClobberEB is an init block, we need to determine if the value
+        /// is a shared variable. If it is, ClobberEB needs to signal the value
+        /// to the CurrentEB. 
+
+
+        /// Iterate through the arguments of the CallBase
+        /// the values that are used in the init block. For this, we need to
+        // if(auto *CB = dyn_cast<CallBase>(I)) {
+        //   for(auto &arg : CB->args()) {
+        //     handleInstruction(CurrentEB, *CB);
+        //     // checkAndAddValue(arg, EDT);
+        //   }
+        //   return true;
+        // }
+        // /// Iterate through the operands of the instruction
+        // for(unsigned int i = 0; i < I->getNumOperands(); i++)
+        //   checkAndAddValue(I->getOperand(i), EDT);
+        // // LLVM_DEBUG(dbgs() << "\n");
+      }
+      return true;
+    };
+
+    LLVM_DEBUG(dbgs() << "[AADataEnvFunction] Checking read/write instructions\n");
+    /// Callback to check a read/write instruction.
+    /// It first verifies if the instruction belongs to an EDT Block, if it
+    /// does it adds it to the RWInsts vector of the EDT. 
+    /// Then it finds the memory access and analyzes its corresponding 
+    /// clobbering access. It the clobbering access is not in the same EDT, it
+    /// Analyzes the operands of the instruction to identify the external values,
+    /// and fills out the DependentValues vector of the EDT.
     auto CheckRWInst = [&](Instruction &I) {
       LLVM_DEBUG(dbgs() << "Checking "<< I <<"\n");
-      auto *BB = I.getParent();
-      auto *EB = AIC.ARTSTransform.getEDTBlock(BB);
-      if(!EB) {
-        LLVM_DEBUG(dbgs() << "[AADataEnvFunction] BB parent: " << BB->getName() << "\n");
+      auto *CurrentBB = I.getParent();
+      /// Ignore lifetime start/end instructions
+      if(I.isLifetimeStartOrEnd())
+        return true;
+      /// Get the EDT block of the instruction
+      EDTBlock *CurrentEB = AT.getEDTBlock(CurrentBB);
+      if(!CurrentEB) {
+        LLVM_DEBUG(dbgs() << "[AADataEnvFunction] BB parent: " 
+                          << CurrentBB->getName() << "\n");
         LLVM_DEBUG(dbgs() << "[AADataEnvFunction] BB is not an EDT region\n");
         indicatePessimisticFixpoint();
         return false;
       }
       /// Handle EDT init block
-      if(EB->Type == EDTBlock::INIT)
-        return handleEDTInitBlock(A, *EB);
-      /// For now, we simply add them to the RWInsts vector
-      EB->EDT->RWInsts.insert(&I);
+      if(CurrentEB->Type == EDTBlock::INIT) 
+        return handleEDTInitBlock(A, I, *CurrentEB);
+      /// Add the instruction to the RWInsts vector
+      CurrentEB->EDT->RWInsts.insert(&I);
+      /// Analyze memory dependencies
+      MemDepResult DepRes = MDA->getDependency(&I);
+      Instruction *DepInst = DepRes.getInst();
+      if(!DepInst) {
+        if(DepRes.isUnknown()) {
+          LLVM_DEBUG(dbgs() << "  - Dependency is unknown\n");
+        }
+        if(DepRes.isNonLocal()) {
+          LLVM_DEBUG(dbgs() << "  - Non local dependency\n");
+          /// If it is a load instruction, get operand
+          if(auto *LI = dyn_cast<LoadInst>(&I)) {
+            Value *UnderlyingObj = getUnderlyingObject(LI->getPointerOperand());
+            LLVM_DEBUG(dbgs() << "  - Underlying object: " << *UnderlyingObj << "\n");
+          }
+          else {
+            Value *UnderlyingObj = getUnderlyingObject(&I);
+            LLVM_DEBUG(dbgs() << "  - Underlying object: " << *UnderlyingObj << "\n");
+          }
+        }
+        
+
+        // LLVM_DEBUG(dbgs() << "  - No memory instruction\n");
+        return true;
+      }
+      LLVM_DEBUG(dbgs() << "  - Memory dependency: " << *DepRes.getInst() << "\n");
+      if(!DepRes.isDef()) {
+        LLVM_DEBUG(dbgs() << "    - Dep is not a memory definition\n");
+        return true;
+      }
+      // if (DepRes.isUnknown() || !DepRes.getInst()) {
+      //   LLVM_DEBUG(dbgs() << "  - No memory access\n");
+      //   return true;
+      // }
+      
+      // Handle instruction
+      // handleInstruction(CurrentEB, I);
+
       return true;
     };
   
@@ -190,7 +470,6 @@ struct AADataEnvFunction : AADataEnv {
       LLVM_DEBUG(dbgs() << "  - checkForAllReadWriteInstructions failed\n");
       return ChangeStatus::UNCHANGED;
     }
-
     indicateOptimisticFixpoint();
     return ChangeStatus::CHANGED;
   }
@@ -214,8 +493,6 @@ struct AADataEnvCallSite : AADataEnv {
   }
 
   ChangeStatus handleParallelRegion(CallBase &CB, Attributor &A) {
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Parallel region - FOUND\n");
-    OutlinedFunction = dyn_cast<Function>(CB.getArgOperand(2));
     /// Get the number of arguments
     unsigned int NumArgs = CB.data_operands_size();
     /// Get private and shared variables
@@ -240,8 +517,10 @@ struct AADataEnvCallSite : AADataEnv {
       ///
       /// Do we need to consider private variables?
     }
+    OutlinedFunction = dyn_cast<Function>(CB.getArgOperand(2));
     /// For now, indicate optimistic fixpoint
     indicateOptimisticFixpoint();
+    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Parallel region - Data environment filled out\n");
     return ChangeStatus::CHANGED;
   }
 
@@ -310,18 +589,18 @@ struct AADataEnvCallSite : AADataEnv {
                              const AAPointerInfo *AAPI)> AccessCB = 
       [&](const AA::RangeTy &Range, const SmallSet<unsigned, 4> &AccIndex,
           const AAPointerInfo *AAPI) {
-      LLVM_DEBUG(dbgs()
-                  << "[" << Range.Offset << "-" << Range.Offset + Range.Size
-                  << "] : " << AccIndex.size() << "\n");
+      // LLVM_DEBUG(dbgs()
+      //             << "[" << Range.Offset << "-" << Range.Offset + Range.Size
+      //             << "] : " << AccIndex.size() << "\n");
       for (auto AI : AccIndex) {
         auto &Acc = AAPI->getAccess(AI);
         auto AccKind = Acc.getKind();
         auto *Inst = Acc.getLocalInst();
-        LLVM_DEBUG(dbgs() << "     - " << AccKind << " - " << *Inst << "\n");
+        // LLVM_DEBUG(dbgs() << "     - " << AccKind << " - " << *Inst << "\n");
 
         if (Acc.isWrittenValueYetUndetermined()) {
-          LLVM_DEBUG(dbgs()
-                      << "       - c: Value written is not known yet \n");
+          // LLVM_DEBUG(dbgs()
+          //             << "       - c: Value written is not known yet \n");
           return false;
         }
         /// Store instruction. 
@@ -332,38 +611,38 @@ struct AADataEnvCallSite : AADataEnv {
             return false;
           /// Check if it is a shared variable
           if(Range.Offset == 0) {
-            LLVM_DEBUG(dbgs() << "       - c: shared variable " << *value << "\n");
+            // LLVM_DEBUG(dbgs() << "       - c: shared variable " << *value << "\n");
             AuxDE.SharedVars.push_back(value);
           }
           /// Check if it is a firstprivate variable
           else if((uint64_t)Range.Offset >= (uint64_t)kmp_task_t_size) {
-            LLVM_DEBUG(dbgs() << "       - c: firstprivate variable " << *value << "\n");
+            // LLVM_DEBUG(dbgs() << "       - c: firstprivate variable " << *value << "\n");
             AuxDE.FirstprivateVars.push_back(value);
           }
-          else
-            LLVM_DEBUG(dbgs() << "       - c: other: " << *value << "\n");
+          // else
+          //   LLVM_DEBUG(dbgs() << "       - c: other: " << *value << "\n");
         }
         /// Read instruction
         else if(AccKind == AAPointerInfo::AccessKind::AK_MUST_READ) {
           // LLVM_DEBUG(dbgs() << "       -- Read instruction\n");
           /// Check if it a load instruction
           if(auto *LI = dyn_cast<LoadInst>(Inst)) {
-            LLVM_DEBUG(dbgs() << "       - Load instruction. Running AA on this.\n");
+            // LLVM_DEBUG(dbgs() << "       - Load instruction. Running AA on this.\n");
             auto *PIL = A.getAAFor<AAPointerInfo>(
               *this, IRPosition::value(*LI), DepClassTy::OPTIONAL);
             if (!PIL->getState().isValidState()) {
               indicatePessimisticFixpoint();
-              LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] PIL is invalid\n");
+              // LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] PIL is invalid\n");
               return false;
             }
             /// Is it a fixpoint?
             if (!PIL->getState().isAtFixpoint()) {
-              LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] PIL is not at fixpoint\n");
+              // LLVM_DEBUG(dbgs() <<"[AADataEnvCallSite] PIL is not at fixpoint\n");
               return false;
             }
             /// For all offset bins in the PI, run AccessCB
             if(!PIL->forallOffsetBins(AccessCB)) {
-              LLVM_DEBUG(dbgs() << "PI forallOffsetBins failed\n");
+              // LLVM_DEBUG(dbgs() << "PI forallOffsetBins failed\n");
               indicatePessimisticFixpoint();
               return false;
             }
@@ -471,8 +750,9 @@ struct AADataEnvCallSite : AADataEnv {
       /// If the data environment is updated, update info in the cache
       auto &AIC = static_cast<ARTSInformationCache &>(A.getInfoCache());
       auto *EB = AIC.ARTSTransform.getEDTBlock(CB.getParent());
-      auto &OMP_DE = EB->OMP.DE;
-      OMP_DE.append(DE);
+      auto &OMP = EB->OMP;
+      OMP.DE.append(DE);
+      OMP.F = OutlinedFunction;
       // LLVM_DEBUG(dbgs() << OMP_DE << "\n");
     }
     return Changed;
@@ -556,6 +836,12 @@ struct AAToARTSFunction : AAToARTS {
   }
 
   bool identifyEDTs(Function &F, ARTSTransformer &AT, Attributor &A) {
+    /// IMPORTANT - TODO
+    /// Keep in mind that is important to consider loops. The following pass
+    /// might be relevant:
+    /// - Dominator Tree
+    /// - LoopInfo
+    /// - Region analysis (https://youtu.be/TjpcaxlgHxk?si=WHINP-Krjk5GB_s_)
     bool Changed = false;
     /// This function identifies the regions that will be transformed to
     /// have and EDT initializer.
@@ -600,22 +886,45 @@ struct AAToARTSFunction : AAToARTS {
     unsigned int TaskRegion = 0;
 
     LLVM_DEBUG(dbgs() << TAG << "Identifying EDT regions\n");
-    EDTInfo *EI = AT.insertEDT(&F);
+    /// Insert a new EDT we haven't created one yet for the function
+    EDTInfo *CurrentEDT = AT.getEDTForFunction(&F);
+    if(!CurrentEDT) {
+      CurrentEDT = AT.insertEDT(&F);
+      /// If it is the main function, insert it to the EDTforFunction map
+      if(F.getName() == "main")
+        AT.insertEDTForFunction(&F, CurrentEDT);
+    }
 
+    /// If function is not IPO amendable, we give up
     if(!A.isFunctionIPOAmendable(F))
       return Changed;
+    
+    /// Fill out set of read/write instructions
+    auto CheckRWInst = [&](Instruction &I) {
+      /// Ignore lifetime start/end instructions
+      if(!I.isLifetimeStartOrEnd())
+        AT.insertRWInst(F, &I);
+      return true;
+    };
+    bool UsedAssumedInformationInCheckRWInst = false;
+    if (!A.checkForAllReadWriteInstructions(
+            CheckRWInst, *this, UsedAssumedInformationInCheckRWInst)) {
+      LLVM_DEBUG(dbgs() << "  - checkForAllReadWriteInstructions failed\n");
+      return Changed;
+    }
     /// Get entry block
-    BasicBlock *CurBB = &(F.getEntryBlock());
-    AT.insertEDTBlock(EI, EDTBlock::ENTRY, CurBB);
+    BasicBlock *CurrentBB = &(F.getEntryBlock());
+    AT.insertEDTBlock(CurrentEDT, EDTBlock::ENTRY, CurrentBB);
     BasicBlock *NextBB = nullptr;
     do {
-      // LLVM_DEBUG(dbgs() << TAG << "CurBB: " << *CurBB << "\n");
-      NextBB = CurBB->getNextNode();
+      // LLVM_DEBUG(dbgs() << TAG << "CurrentBB: " << *CurrentBB << "\n");
+      NextBB = CurrentBB->getNextNode();
       /// Get first instruction of the function
-      Instruction *CurI = &(CurBB->front());
+      Instruction *CurrentI = &(CurrentBB->front());
       do {
-        // LLVM_DEBUG(dbgs() << TAG << "CurI: " << *CurI << "\n");
-        auto *CB = dyn_cast<CallBase>(CurI);
+        // LLVM_DEBUG(dbgs() << TAG << "CurrentI: " << *CurrentI << "\n");
+        /// We are only interested in call instructions
+        auto *CB = dyn_cast<CallBase>(CurrentI);
         if (!CB)
           continue;
         /// Get the callee
@@ -626,62 +935,77 @@ struct AAToARTSFunction : AAToARTS {
             OMPInfo OI(OMPInfo::PARALLEL, CB);
             /// Split block at __kmpc_parallel
             BasicBlock *ParallelBB = 
-              SplitBlock(CurI->getParent(), CurI, DT, LI, nullptr,
+              SplitBlock(CurrentI->getParent(), CurrentI, DT, LI, nullptr,
                         "par.region." + std::to_string(ParallelRegion));
-            EDTBlock *EB = AT.insertEDTBlock(EI, EDTBlock::INIT, ParallelBB, OI);
-            AT.insertEDTWithDep(EI, EB);
+            /// Insert EDT block for the parallel init region to current EDT. Then 
+            /// create empty EDT for the outlined function and set init block.
+            EDTBlock *ParallelInitBlock = 
+              AT.insertEDTBlock(CurrentEDT, EDTBlock::INIT, ParallelBB, OI);
+            EDTInfo *ParallelEDT = AT.insertEDT(&F, ParallelInitBlock);
+            // AT.insertEDTWithDep(CurrentEDT, EB);
             /// Split block at the next instruction
-            CurI = CurI->getNextNonDebugInstruction();
+            CurrentI = CurrentI->getNextNonDebugInstruction();
             BasicBlock *ParallelDone = 
-              SplitBlock(ParallelBB, CurI, DT, LI, nullptr,
+              SplitBlock(ParallelBB, CurrentI, DT, LI, nullptr,
                         "par.done." + std::to_string(ParallelRegion));
             NextBB = ParallelDone;
             ParallelRegion++;
-            /// Create new EDT and add dependency from par.region 
-            /// to par.done
-            EI = AT.insertEDTWithDep(EI, &F);
-            AT.insertEDTBlock(EI, EDTBlock::ENTRY, ParallelDone);
+            /// Create new EDT and add dependency from current EDT to the new EDT.
+            /// Then, insert EDT block for the parallel done region to the new EDT.
+            /// Finally add dependency from par.region to par.done
+            CurrentEDT = AT.insertEDT(&F);
+            // AT.insertEDTWithDep(CurrentEDT, &F);
+            AT.insertEDTBlock(CurrentEDT, EDTBlock::ENTRY, ParallelDone);
+            AT.insertDep(ParallelEDT, CurrentEDT);
           }
           break;
           case OMPInfo::TASKALLOC: {
             OMPInfo OI(OMPInfo::TASK, CB);
             /// Split block at __kmpc_omp_task_alloc
             BasicBlock *TaskBB = 
-              SplitBlock(CurI->getParent(), CurI, DT, LI, nullptr,
+              SplitBlock(CurrentI->getParent(), CurrentI, DT, LI, nullptr,
                         "task.region." + std::to_string(TaskRegion));
-            EDTBlock *EB = AT.insertEDTBlock(EI, EDTBlock::INIT, TaskBB, OI);
-            AT.insertEDTWithDep(EI, EB);
+            /// Insert EDT block for the task init region to current EDT. Then 
+            /// create empty EDT for the outlined function, and add dependency from 
+            /// current EDT to the new EDT.
+            EDTBlock *TaskInitBlock = 
+              AT.insertEDTBlock(CurrentEDT, EDTBlock::INIT, TaskBB, OI);
+            EDTInfo *TaskEDT = AT.insertEDT(&F, TaskInitBlock);
+            // AT.insertEDTWithDep(CurrentEDT, TaskInitBlock);
             /// Find the task call
-            while ((CurI = CurI->getNextNonDebugInstruction())) {
-              auto *TCB = dyn_cast<CallBase>(CurI);
+            while ((CurrentI = CurrentI->getNextNonDebugInstruction())) {
+              auto *TCB = dyn_cast<CallBase>(CurrentI);
               if(TCB && 
                 OMPInfo::getRTFunction(TCB->getCalledFunction()) == OMPInfo::TASK)
                 break;
             }
-            assert(CurI && "Task RT call not found");
+            assert(CurrentI && "Task RT call not found");
             /// Split block again at the next instruction
-            CurI = CurI->getNextNonDebugInstruction();
+            CurrentI = CurrentI->getNextNonDebugInstruction();
             BasicBlock *TaskDone = 
-              SplitBlock(TaskBB, CurI, DT, LI, nullptr,
+              SplitBlock(TaskBB, CurrentI, DT, LI, nullptr,
                         "task.done." + std::to_string(TaskRegion));
             NextBB = TaskDone;
             TaskRegion++;
-            /// Create new EDT and add dependency from par.region 
-            /// to par.done
-            EI = AT.insertEDTWithDep(EI, &F);
-            AT.insertEDTBlock(EI, EDTBlock::ENTRY, TaskDone, OI);
+            /// Create new EDT and add dependency from current EDT to the new EDT.
+            /// Then, insert EDT block for the task done region to the new EDT.
+            /// Finally add dependency from task.region to task.done
+            CurrentEDT = AT.insertEDT(&F);
+            // AT.insertEDTWithDep(CurrentEDT, &F);
+            AT.insertEDTBlock(CurrentEDT, EDTBlock::ENTRY, TaskDone, OI);
+            AT.insertDep(TaskEDT, CurrentEDT);
           }
           break;
           case OMPInfo::TASKWAIT: {
             /// \Note A taskwait requires an event.
             /// Split block at __kmpc_omp_taskwait
             BasicBlock *TaskWaitBB = 
-              SplitBlock(CurI->getParent(), CurI, DT, LI, nullptr,
+              SplitBlock(CurrentI->getParent(), CurrentI, DT, LI, nullptr,
                         "taskwait.region." + std::to_string(TaskRegion));
             /// Split block again at the next instruction
-            CurI = CurI->getNextNonDebugInstruction();
+            CurrentI = CurrentI->getNextNonDebugInstruction();
             BasicBlock *TaskWaitDone = 
-              SplitBlock(TaskWaitBB, CurI, DT, LI, nullptr,
+              SplitBlock(TaskWaitBB, CurrentI, DT, LI, nullptr,
                         "taskwait.done." + std::to_string(TaskRegion));
             NextBB = TaskWaitDone;
             /// Add the taskwait region to the map
@@ -705,46 +1029,15 @@ struct AAToARTSFunction : AAToARTS {
             continue;
           break;
         }
-      } while ((CurI = CurI->getNextNonDebugInstruction()));
+      } while ((CurrentI = CurrentI->getNextNonDebugInstruction()));
 
-    } while ((CurBB = NextBB));
+    } while ((CurrentBB = NextBB));
 
-    LLVM_DEBUG(dbgs() << TAG << "Identifying EDT regions done\n");
-                      // << AT.EDTs << "\n");
+    LLVM_DEBUG(dbgs() << TAG << "Identifying EDT regions done with: "
+                      << AT.EDTsFromFunction[&F].size() << "\n");
 
     Changed = true;
     return Changed;
-  }
-
-  void checkValue(Value *Val, ARTSTransformer &AT, EDTInfo *EDT) {
-    // Type *ValType = Val->getType();
-    // LLVM_DEBUG(dbgs() << "  - Operand: " << *Val << "\n");
-    // LLVM_DEBUG(dbgs() << "    - Operand type: " << *ValType << "\n");
-
-    if(isa<Argument>(Val)) {
-      // LLVM_DEBUG(dbgs() << "    - It is an Argument\n");
-      return;
-    }
-
-    auto *ValInst = dyn_cast<Instruction>(Val);
-    if(!ValInst) {
-      /// It can be a constant value...
-      // LLVM_DEBUG(dbgs() << "    - It is not an Instruction\n");
-      return;
-    }
-
-    /// Check if the instruction is in the same EDT Data scope
-    // LLVM_DEBUG(dbgs() << "    - It is an Instruction\n");
-    auto *EB = AT.getEDTBlock(ValInst->getParent());
-    EB->Analyzed = true;
-    if(EB->EDT->ID == EDT->ID) {
-      // LLVM_DEBUG(dbgs() << "    - It is in the same EDT\n");
-      return;
-    }
-    else {
-      // LLVM_DEBUG(dbgs() << "    - It is not in the same EDT\n");
-      EDT->ExternalValues.insert(ValInst);
-    }
   }
 
   void initialize(Attributor &A) override {
@@ -760,10 +1053,106 @@ struct AAToARTSFunction : AAToARTS {
     /// The rest is handled in the updateImpl function
   }
 
+  // void fillExternalValues(ARTSTransformer &AT, MemorySSA &MSSA, Function *F) {
+  //   /// This function fills the ExternalValues set of each EDT. It iterates
+  //   /// through the EDTs and for each EDT it iterates through the RWInsts set
+  //   /// to identify the values that are not in the same EDT.
+  //   LLVM_DEBUG(dbgs() << TAG << "Filling ExternalValues\n");
+  //   auto checkAndAddValue = [&](Value *Val, EDTInfo *EDT) {
+  //     // Type *ValType = Val->getType();
+  //     LLVM_DEBUG(dbgs() << "  - Operand: " << *Val << "\n");
+  //     // LLVM_DEBUG(dbgs() << "    - Operand type: " << *ValType << "\n");
+  //     if(isa<Argument>(Val)) {
+  //       // LLVM_DEBUG(dbgs() << "    - It is an Argument\n");
+  //       return;
+  //     }
+  //     auto *ValInst = dyn_cast<Instruction>(Val);
+  //     if(!ValInst) {
+  //       /// It can be a constant value...
+  //       // LLVM_DEBUG(dbgs() << "    - It is not an Instruction\n");
+  //       return;
+  //     }
+  //     // /// It is also important to consider global variables
+  //     // void getGlobalsUsedByFunction(const Function &F, set<GlobalValue*> *Globals) {
+  //     //   for (const BasicBlock &BB : F)
+  //     //     for (const Instruction &I : BB)
+  //     //       for (const Value *Op : I.operands())
+  //     //         if (const GlobalValue* G = dyn_cast<GlobalValue>(*Op))
+  //     //           Globals->insert(G);
+  //     // }
+  //     /// Check if the instruction is in the same EDT Data scope
+  //     // LLVM_DEBUG(dbgs() << "    - It is an Instruction\n");
+  //     auto *EB = AT.getEDTBlock(ValInst->getParent());
+  //     EB->Analyzed = true;
+  //     if(EB->EDT->ID == EDT->ID) {
+  //       LLVM_DEBUG(dbgs() << "    - It is in the same EDT\n");
+  //       return;
+  //     }
+  //     LLVM_DEBUG(dbgs() << "    - It is not in the same EDT\n");
+  //     EDT->ExternalValues.insert(ValInst);
+  //   };
+
+  //   LLVM_DEBUG(dbgs() << "\n" << TAG << "EDTs created from this function:" << "\n");
+  //   for(auto *EDT : AT.EDTsFromFunction[F]) {
+  //     LLVM_DEBUG(dbgs() << "EDT #" << EDT->ID << "\n");
+  //     /// If the EDT has external values, we already analyzed it.
+  //     /// Skip it for now.
+  //     if(EDT->ExternalValues.size() != 0)
+  //       continue;
+  //     /// Print RW instructions
+  //     LLVM_DEBUG(dbgs() << "RW instructions: "<< EDT->RWInsts.size() << "\n");
+  //     for(auto *I : EDT->RWInsts) {
+  //       LLVM_DEBUG(dbgs() << "  - " << *I << "\n");
+  //       MemoryAccess *MA = MSSA.getMemoryAccess(I);
+  //       if(!MA) {
+  //         LLVM_DEBUG(dbgs() << "    - MemoryAccess not found\n");
+  //         return;
+  //       }
+  //       if(auto *Def = dyn_cast_or_null<MemoryDef>(MA)) {
+  //         LLVM_DEBUG(dbgs() << "    MemoryDef: " << *Def << "\n");
+  //         Instruction *DefInst = Def->getMemoryInst();
+  //         LLVM_DEBUG(dbgs() << "        Def: " << *DefInst << '\n');
+  //       }
+  //       else if (auto *Use = dyn_cast_or_null<MemoryUse>(MA)) {
+  //         LLVM_DEBUG(dbgs() << "    MemoryUse: " << *Use << "\n");
+  //         Instruction *UseInst = Use->getMemoryInst();
+  //         LLVM_DEBUG(dbgs() << "      Use: " << *UseInst << '\n');
+  //       }
+  //       else if (auto *Phi = dyn_cast_or_null<MemoryPhi>(MA)) {
+  //       LLVM_DEBUG(dbgs() << "      MemoryPhi: " << *Phi << "\n");
+  //         // Instruction *PhiInst = Phi->getMemoryInst();
+  //         // LLVM_DEBUG(dbgs() << "  Phi: " << *PhiInst << '\n');
+  //       }
+  //       else if (auto *DefPhi = dyn_cast_or_null<MemoryDef>(MA)) {
+  //         LLVM_DEBUG(dbgs() << "    MemoryDefPhi: " << *DefPhi << "\n");
+  //         Instruction *DefPhiInst = DefPhi->getMemoryInst();
+  //         LLVM_DEBUG(dbgs() << "      DefPhi: " << *DefPhiInst << '\n');
+  //       }
+  //       // else {
+  //       //   LLVM_DEBUG(dbgs() << "MemoryAccess: " << *MA << "\n");
+  //       //   Instruction *MAInst = MA->getMemoryInst();
+  //       //   LLVM_DEBUG(dbgs() << "  MA: " << *MAInst << '\n');
+  //       // }
+  //       /// Iterate through the arguments of the CallBase
+  //       if(auto *CB = dyn_cast<CallBase>(I)) {
+  //         //     if(CB->isLifetimeStartOrEnd())
+  //         //       continue;
+  //         for(auto &arg : CB->args()) {
+  //           checkAndAddValue(arg, EDT);
+  //         }
+  //         continue;
+  //       }
+  //       /// Iterate through the operands of the instruction
+  //       for(unsigned int i = 0; i < I->getNumOperands(); i++)
+  //         checkAndAddValue(I->getOperand(i), EDT);
+  //       // LLVM_DEBUG(dbgs() << "\n");
+  //     }
+  //   }
+  // }
+
   ChangeStatus updateImpl(Attributor &A) override {
     Function *F = getAnchorScope();
     LLVM_DEBUG(dbgs() << "[AAToARTSFunction] updateImpl: " << F->getName() << "\n");
-
     /// Get the data environment of the function. If successful, it returns
     /// the list of instructions that may read or write to memory in the function.
     auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
@@ -773,158 +1162,79 @@ struct AAToARTSFunction : AAToARTS {
     if (!DEAA->getState().isValidState()) {
       LLVM_DEBUG(dbgs() <<"[AAToARTSFunction] DEAA is invalid\n");
       indicatePessimisticFixpoint();
-      return;
+      return ChangeStatus::CHANGED;
     }
     if(!DEAA->getState().isAtFixpoint()) {
       LLVM_DEBUG(dbgs() <<"[AAToARTSFunction] DEAA is not at fixpoint\n");
-      return;
+      return ChangeStatus::UNCHANGED;
     }
     LLVM_DEBUG(dbgs() <<"[AAToARTSFunction] DEAA is at fixpoint\n");
 
-    /// Iterate through the EDT blocks to identify the list of instructions
-    /// that may read or write to memory but doesn't belong to the EDT.
+    
+    // fillExternalValues(AT, F);
+    /// Iterate through the EDTs to analyze the EDT with empty number of Blocks
+    LLVM_DEBUG(dbgs() << "\n" << TAG << "EDTs with empty number of Blocks:\n");
     for(auto *EDT : AT.EDTsFromFunction[F]) {
-      // LLVM_DEBUG(dbgs() << "EDT #" << EDT->ID << "\n");
-      /// Print RW instructions
-      // LLVM_DEBUG(dbgs() << "RW instructions:\n");
-      for(auto *I : EDT->RWInsts) {
-        // LLVM_DEBUG(dbgs() << "  - " << *I << "\n");
-        /// Iterate through the arguments of the callbase
-        if(auto *CB = dyn_cast<CallBase>(I)) {
-          for(auto &arg : CB->args())
-            checkValue(arg, AT, EDT);
-          continue;
-        }
-        /// Iterate through the operands of the instruction
-        for(unsigned int i = 0; i < I->getNumOperands(); i++)
-          checkValue(I->getOperand(i), AT, EDT);
-        // LLVM_DEBUG(dbgs() << "\n");
+      if(EDT->Blocks.size() != 0)
+        continue;
+      LLVM_DEBUG(dbgs() << "EDT #" << EDT->ID << "\n");
+      auto *EDTInit = EDT->Init;
+      /// The EDT must have an EDTInit and it must have an OMPInfo
+      if(!EDTInit && EDTInit->HasOMP) {
+        LLVM_DEBUG(dbgs() << "  - EDTInit with OMPInfo not found\n");
+        indicatePessimisticFixpoint();
+        return ChangeStatus::CHANGED;
       }
-     
+      /// Print where the EDTInit belongs to
+      auto &OMP = EDTInit->OMP;
+      LLVM_DEBUG(dbgs() << "  - EDTInit: " << EDTInit->BB->getName() << "\n");
+      LLVM_DEBUG(dbgs() << "  - OMP: " << OMP.F->getName() << "\n");
+      /// Add it to the EDTForFunction map
+      AT.insertEDTForFunction(OMP.F, EDT);
+      /// Run AAToARTS on the EDTInit function
+      auto *OMPFAA = A.getAAFor<AAToARTS>(
+        *this, IRPosition::function(*OMP.F), DepClassTy::OPTIONAL);
+      if (!OMPFAA->getState().isValidState()) {
+        LLVM_DEBUG(dbgs() <<"[AAToARTSFunction] OMPFAA is invalid\n");
+        indicatePessimisticFixpoint();
+        return ChangeStatus::CHANGED;
+      }
+      if(!OMPFAA->getState().isAtFixpoint()) {
+        LLVM_DEBUG(dbgs() <<"[AAToARTSFunction] OMPFAA is not at fixpoint\n");
+        return ChangeStatus::UNCHANGED;
+      }
     }
-    LLVM_DEBUG(dbgs() << TAG << "EDTs INFORMATION\n");
-    LLVM_DEBUG(dbgs() << TAG << AT.EDTs << "\n");
 
+    
+    
+    
+    /// If this is the main function
+    if(F->getName() == "main") {
+      LLVM_DEBUG(dbgs() << TAG << "----------- PROCESS HAS FINISHED -----------\n");
+      EDTInfo *MainEDT = AT.getEDTForFunction(F);
+      LLVM_DEBUG(dbgs() << TAG << "----------- EDTs INFORMATION -----------\n");
+      LLVM_DEBUG(dbgs() << *MainEDT << "\n");
 
-    return ChangeStatus::UNCHANGED;
+    /// If it is not an EDT region, get data environment based on the 
+    /// MemorySSA analysis. We will do this process until 
+    /// the function is done or we reach another EDT region.
+
+    // DominatorTree *DT = AG.getAnalysis<DominatorTreeAnalysis>(*F);
+    // ScalarEvolution *SE =
+    //   A.getInfoCache().getAnalysisResultForFunction<ScalarEvolutionAnalysis>(F);
+    // LoopInfo *LI = AG.getAnalysis<LoopAnalysis>(*F);
+
+    // LV = &getAnalysis<LiveVariables>();
+    // LoopInfo &LI = AG.getAnalysis<LoopInfoWrapperPass>(*F)->getLoopInfo();
+
+    }
+    indicateOptimisticFixpoint();
+    return ChangeStatus::CHANGED;
   }
 
   ChangeStatus manifest(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
     LLVM_DEBUG(dbgs() << "[AAToARTSFunction] Manifest\n");
-    return Changed;
-  }
-};
-
-struct AAToARTSBasicBlock : AAToARTS {
-  AAToARTSBasicBlock(const IRPosition &IRP, Attributor &A)
-      : AAToARTS(IRP, A) {}
-
-  /// See AbstractAttribute::getAsStr()
-  const std::string getAsStr(Attributor *A) const override {
-    if (!isValidState())
-      return "<invalid>";
-
-    std::string Str("AAToARTSBasicBlock: ");
-
-    return Str + std::string("OK");
-  }
-
-  void handleEDTInitRegion(EDTInfo *EI, Attributor &A) {
-    // auto &DE = EI->DE;
-    // LLVM_DEBUG(dbgs() <<"[AAToARTSBasicBlock] Analyzing: " << DE.getCBName() << "\n");
-    // /// Get data environment of the EDT callbase
-    // auto *DEAA = A.getAAFor<AADataEnv>(
-    //   *this, IRPosition::callsite_function(*DE.CB), DepClassTy::OPTIONAL);
-    // if (!DEAA->getState().isValidState() || !DEAA->getState().isAtFixpoint()) {
-    //   LLVM_DEBUG(dbgs() <<"[AAToARTSBasicBlock] DEAA is invalid or not at fixpoint\n");
-    //   indicatePessimisticFixpoint();
-    //   return;
-    // }
-    // /// Print the data environment for now
-    // LLVM_DEBUG(dbgs() << DE << "\n");
-  }
-
-  void initialize(Attributor &A) override {
-    // BasicBlock &BB = cast<BasicBlock>(getAnchorValue());
-    // /// Get Data environment for the BB
-    // LLVM_DEBUG(dbgs() <<"[AAToARTSBasicBlock] initialize: " << BB.getName() << "\n");
-    // auto *DEAA = A.getAAFor<AADataEnv>(
-    //   *this, IRPosition::value(BB), DepClassTy::OPTIONAL);
-    // if (!DEAA->getState().isValidState() || !DEAA->getState().isAtFixpoint()) {
-    //   LLVM_DEBUG(dbgs() <<"[AAToARTSBasicBlock] DEAA is invalid or not at fixpoint\n");
-    //   indicatePessimisticFixpoint();
-    //   return;
-    // }
-    // /// If it is a fixpoint, we can proceed to analyze the successors
-    // if (BB.getTerminator()->getNumSuccessors() != 1) {
-    //   LLVM_DEBUG(dbgs() << "[AAToARTSBasicBlock] BB has more than one successor\n");
-    //   /// For now indicate pessimistic fixpoint
-    //   indicatePessimisticFixpoint();
-    //   return;
-    // }
-    // BasicBlock *SuccBB = BB.getTerminator()->getSuccessor(0);
-    // /// Get SuccBB data environment
-    // auto *SuccDEAA = A.getAAFor<AADataEnv>(
-    //   *this, IRPosition::value(*SuccBB), DepClassTy::OPTIONAL);
-    // if (!SuccDEAA->getState().isValidState() || !SuccDEAA->getState().isAtFixpoint()) {
-    //   LLVM_DEBUG(dbgs() <<"[AAToARTSBasicBlock] SuccDEAA is invalid or not at fixpoint\n");
-    //   indicatePessimisticFixpoint();
-    //   return;
-    // }
-    // /// If it is a fixpoint, we can analyze both data environments
-    // /// The idea here is to determine if a shared variable in the current BB 
-    // /// is written or read in the successor BB. If so, we need to signal the value
-    // DEAA->dumpDataEnv();
-    // SuccDEAA->dumpDataEnv();
-
-  }
-
-  ChangeStatus updateImpl(Attributor &A) override {
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    /// Cast value to BasicBlock
-    BasicBlock &BB = cast<BasicBlock>(getAnchorValue());
-    LLVM_DEBUG(dbgs() << "[AAToARTSBasicBlock] updateImpl: " <<BB.getName() <<"\n");
-    
-    return Changed;
-  }
-
-  ChangeStatus manifest(Attributor &A) override {
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    // /// Cast value to BasicBlock
-    // BasicBlock &BB = cast<BasicBlock>(getAnchorValue());
-    // LLVM_DEBUG(dbgs() << "[AAToARTSBasicBlock] Manifest: " <<BB.getName() <<"\n");
-    // auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
-    // auto *EI = ARTSInfoCache.ARTSTransform.getEDTBlock(BB);
-    /// Get parent function
-    // Function *F = BB.getParent();
-    // MemorySSA &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
-    // AliasAnalysis &AA = AM.getResult<AAManager>(F);
-
-    // auto &ARTSBuilder = ARTSInfoCache.ARTSBuilder;
-    // Function *newEDT = ARTSBuilder.createEDT(*EI, &BB);
-    // if(!newEDT)
-    //   Changed |= ChangeStatus::CHANGED;
-    // /// We have to analyze the BB successors. We need to check for the following
-    // /// cases:
-    // /// - If the successor (par/task.done BB) reads any of the shared variables
-    // ///   in the data environment, it needs to be transformed to an EDT, and the
-    // ///   current BB needs to signal the value.
-    // /// - If not, there is a control dependency between the current BB and the
-    // ///   successor. Here, there are two cases:
-    // ///   - The successor has a taskwait/taskwait_deps call. In this case,
-    // ///     it would be interesting to create an ARTS API function that waits
-    // ///     for a list of EDTs to finish (using the GUIDs).
-    // /// 
-    // /// Check if number of successors is 1. 
-    // if (BB.getTerminator()->getNumSuccessors() != 1) {
-    //   LLVM_DEBUG(dbgs() << "[AAToARTSBasicBlock] BB has more than one successor\n");
-    //   indicatePessimisticFixpoint();
-    //   return Changed;
-    // }
-    // BasicBlock *SuccBB = BB.getTerminator()->getSuccessor(0);
-    /// Get SuccBB data environment
-    // LLVM_DEBUG(dbgs() << "[AAToARTSBasicBlock] Manifest\n");
     return Changed;
   }
 };
@@ -939,14 +1249,12 @@ AAToARTS &AAToARTS::createForPosition(const IRPosition &IRP,
   case IRPosition::IRP_RETURNED:
   case IRPosition::IRP_CALL_SITE_RETURNED:
   case IRPosition::IRP_CALL_SITE:
+  case IRPosition::IRP_FLOAT:
     llvm_unreachable(
         "AAToARTS can only be created for function/float position!");
     break;
   case IRPosition::IRP_FUNCTION:
     AA = new (A.Allocator) AAToARTSFunction(IRP, A);
-    break;
-  case IRPosition::IRP_FLOAT:
-    AA = new (A.Allocator) AAToARTSBasicBlock(IRP, A);
     break;
   }
   return *AA;
@@ -958,34 +1266,7 @@ const char AAToARTS::ID = 0;
 /// ---------------------------- ARTS TRANSFORM ---------------------------- ///
 bool ARTSTransformer::run(Attributor &A) {
   bool changed = false;
-  
-  /// Identify EDT regions
-  // changed |= identifyEDTInitRegions(A);
-  // Function *EDT = ARTSIRB.createEDT("fib");
-  // LLVM_DEBUG(dbgs() << TAG << "EDT: \n" << *EDT << "\n");
-  // if(!changed) {
-  //   LLVM_DEBUG(dbgs() << TAG << "No EDT regions found\n");
-  //   return changed;
-  // }
-  /// Run attributor on the EDTInitRegions
   /// The process start in the main function, we which will converted to an EDT.
-  /// We start the process by iterating through the BBs of the main function. 
-  /// The idea is to get the data environment of the BB. There are two cases here:
-  /// - The BB is an EDTInitRegion (parallel, task...). In this case, we simply in the 
-  ///   corresponding callsite.
-  /// - The BB is not an EDTInitRegion. In this case, we need to run the MemorySSA
-  ///   analysis on the BB to obtain the data environment (memory definition and
-  ///   uses -> shared and firstprivate variables).
-  /// After this, we need to analyze the BB successors. We need to check for the
-  /// following cases:
-  /// - If the successor (par/task.done BB) reads any of the shared variables
-  ///   in the data environment.
-  /// - If not, there is a control dependency between the current BB and the
-  ///   successor. Here, there are two cases:
-  ///   - The successor has a taskwait/taskwait_deps call. In this case,
-  ///     we can crete an event
-
-  /// Get main function
   Function *MainF = M.getFunction("main");
   if(!MainF) {
     LLVM_DEBUG(dbgs() << TAG << "Main function not found\n");
@@ -998,6 +1279,9 @@ bool ARTSTransformer::run(Attributor &A) {
           DepClassTy::NONE, /* ForceUpdate */ false,
           /* UpdateAfterInit */ true);
   changed |= runAttributor(A);
+
+  LLVM_DEBUG(dbgs() << TAG << "\nEDTs INFORMATION\n");
+  LLVM_DEBUG(dbgs() << TAG << EDTs << "\n");
   return changed;
 }
 
@@ -1009,7 +1293,7 @@ bool ARTSTransformer::runAttributor(Attributor &A) {
   return Changed == ChangeStatus::CHANGED;
 }
 
-/// ---------------------------- ARTS TRANSFORMATION PASS ---------------------------- ///
+/// ------------------------ ARTS TRANSFORMATION PASS ------------------------ ///
 PreservedAnalyses ARTSTransformPass::run(Module &M, ModuleAnalysisManager &AM) {
   /// Command line options
   if (!EnableARTSTransformation)
@@ -1041,6 +1325,9 @@ PreservedAnalyses ARTSTransformPass::run(Module &M, ModuleAnalysisManager &AM) {
   BumpPtrAllocator Allocator;
   ARTSInformationCache InfoCache(M, AG, Allocator, &Functions);
   AttributorConfig AC(CGUpdater);
+  AC.IsModulePass = true;
+  AC.DeleteFns = false;
+  AC.RewriteSignatures = false;
   Attributor A(Functions, InfoCache, AC);
 
   /// Run ARTSTransform
