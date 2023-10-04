@@ -170,22 +170,26 @@ struct AADataEnvFunction : AADataEnv {
     Function &F = cast<Function>(getAnchorValue());
     LLVM_DEBUG(dbgs() << "[AADataEnvFunction] updateImpl: "
                       << F.getName() << "\n");
-    /// Get cache
-    auto &AIC = static_cast<ARTSInformationCache &>(A.getInfoCache());
-    auto &AT = AIC.ARTSTransform;
     /// Get MemorySSA
     // MemorySSA &MSSA = AIC.AG.getAnalysis<MemorySSAAnalysis>(F)->getMSSA();
     // MemorySSAWalker *Walker = MSSA.getWalker();
     // MSSA.dump();
+    /// Run Liveness AA to current function
     auto *LivenessAA =
       A.getAAFor<AAIsDead>(*this, getIRPosition(), DepClassTy::OPTIONAL);
+    if(LivenessAA && !LivenessAA->getState().isAtFixpoint())
+      return ChangeStatus::UNCHANGED;
+  
+    /// Get cache
+    auto &AIC = static_cast<ARTSInformationCache &>(A.getInfoCache());
+    auto &AT = AIC.ARTSTransform;
     /// Iterate through the R/W instructions of the function
-    for(auto *I: AT.getRWInsts(&F)) {
+    for(auto *I: AT.RWInsts[&F]) {
       /// Get the EDT block of the instruction
       EDTBlock *CurrentEB = AT.getEDTBlock(I);
       if(!CurrentEB)
         return returnPessimisticFixpoint();
-  
+
       /// Handle EDT init block
       if(CurrentEB->isInit()) {
         /// If the EDT init block could not be handled, it can be because
@@ -193,13 +197,12 @@ struct AADataEnvFunction : AADataEnv {
         if(!handleEDTInitBlock(A, *I, *CurrentEB))
           return ChangeStatus::UNCHANGED;
       }
-      /// Add the instruction to the RWInsts vector
-      CurrentEB->insertRWInst(&I);
       /// Now we check if the instruction is assumed dead
-      if (A.isAssumedDead(I, *this, LivenessAA, UsedAssumedInformation,
+      bool UsedAssumedInformation = false;
+      if (A.isAssumedDead(*I, *this, LivenessAA, UsedAssumedInformation,
                           /* CheckBBLivenessOnly */ true, DepClassTy::OPTIONAL,
                           /* CheckForDeadStore */ true))
-
+        LLVM_DEBUG(dbgs() << "[AADataEnvFunction] Instruction is dead: " << *I << "\n");
     }
 
     indicateOptimisticFixpoint();
@@ -630,20 +633,7 @@ struct AAToARTSFunction : AAToARTS {
     /// If function is not IPO amendable, we give up
     if(!A.isFunctionIPOAmendable(F))
       return Changed;
-    
-    /// Fill out set of read/write instructions
-    auto CheckRWInst = [&](Instruction &I) {
-      /// Ignore lifetime start/end instructions
-      if(!I.isLifetimeStartOrEnd())
-        AT.insertRWInst(F, &I);
-      return true;
-    };
-    bool UsedAssumedInformationInCheckRWInst = false;
-    if (!A.checkForAllReadWriteInstructions(
-            CheckRWInst, *this, UsedAssumedInformationInCheckRWInst)) {
-      LLVM_DEBUG(dbgs() << "  - checkForAllReadWriteInstructions failed\n");
-      return Changed;
-    }
+
     /// Get entry block
     BasicBlock *CurrentBB = &(F.getEntryBlock());
     AT.insertEDTBlock(CurrentEDT, EDTBlock::ENTRY, CurrentBB);
@@ -764,6 +754,20 @@ struct AAToARTSFunction : AAToARTS {
       } while ((CurrentI = CurrentI->getNextNonDebugInstruction()));
 
     } while ((CurrentBB = NextBB));
+
+    /// Fill out set of read/write instructions
+    auto CheckRWInst = [&](Instruction &I) {
+      /// Ignore lifetime start/end instructions
+      if(!I.isLifetimeStartOrEnd())
+        AT.insertRWInst(&F, &I);
+      return true;
+    };
+    bool UsedAssumedInformationInCheckRWInst = false;
+    if (!A.checkForAllReadWriteInstructions(
+            CheckRWInst, *this, UsedAssumedInformationInCheckRWInst)) {
+      LLVM_DEBUG(dbgs() << "  - checkForAllReadWriteInstructions failed\n");
+      return Changed;
+    }
 
     LLVM_DEBUG(dbgs() << TAG << "Identifying EDT regions done with: "
                       << AT.EDTsFromFunction[&F].size() << "\n");

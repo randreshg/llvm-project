@@ -185,10 +185,6 @@ struct EDTBlock {
     return (Type == INIT);
   }
 
-  void insertRWInst(Instruction *I) {
-    EDT->RWInsts.insert(I);
-  }
-
   /// ---------------------------- Attributes ---------------------------- ///
   /// Pointer to EDT where the EDTBlock belongs
   EDTInfo *EDT;
@@ -382,13 +378,11 @@ struct ARTSTransformer {
     EDTForFunction.insert(std::make_pair(F, EDTI));
   }
 
-  /// ---------------------------- EDTBlock Map ---------------------------- ///
+  /// ---------------------------- RWInsts Map ---------------------------- ///
   void insertRWInst(Function *F, Instruction *I) {
     RWInsts[F].insert(I);
-  }
-
-  SmallPtrSet<EDTInfo *, 4> &getRWInsts(Function *F) {
-    return RWInsts[F];
+    EDTBlock *EDTB = getEDTBlock(I);
+    EDTB->EDT->RWInsts.insert(I);
   }
 
   /// ---------------------------- Attributes ---------------------------- ///
