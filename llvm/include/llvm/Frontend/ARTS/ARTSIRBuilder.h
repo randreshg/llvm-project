@@ -55,11 +55,17 @@ public:
   /// correct signature and returns it.
   Function *createEDT(StringRef Name);
 
+  /// Given a EDT Block and a EDT Function, it inserts the Basic Block
+  /// into the Function.
+  void insertEDTBlock(EDTBlock *EB, Function *EDTFunc);
+
+
+
   /// Initializes EDT Function. It inserts the call to the
   /// runtime function to reserve the GUID for the EDT, then it calls 
   /// artsEdtCreateWithGuid to create the EDT. 
   Function *initializeEDT(EDTInfo &EDTI, Function *EDTFunc,
-                          BasicBlock *curBB = nullptr);
+                          BasicBlock *CurBB = nullptr);
   AllocaInst *reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node);
 
   /// Declarations for LLVM-IR types (simple, array, function and structure) are

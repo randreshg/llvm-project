@@ -8,7 +8,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Frontend/ARTS/ARTSIRBuilder.h"
-#include "llvm/Frontend/ARTS/ARTSConstants.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -19,6 +18,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Frontend/ARTS/ARTSConstants.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/CallingConv.h"
@@ -58,30 +58,30 @@ static constexpr auto TAG = "[" DEBUG_TYPE "] ";
 using namespace llvm;
 using namespace arts;
 
-FunctionCallee
-ARTSIRBuilder::getOrCreateRuntimeFunction(Module &M, RuntimeFunction FnID) {
+FunctionCallee ARTSIRBuilder::getOrCreateRuntimeFunction(Module &M,
+                                                         RuntimeFunction FnID) {
   FunctionType *FnTy = nullptr;
   Function *Fn = nullptr;
 
   // Try to find the declaration in the module first.
   switch (FnID) {
-    #define ARTS_RTL(Enum, Str, IsVarArg, ReturnType, ...)                          \
-      case Enum:                                                                   \
-        FnTy = FunctionType::get(ReturnType, ArrayRef<Type *>{__VA_ARGS__},        \
-                                IsVarArg);                                        \
-        Fn = M.getFunction(Str);                                                   \
-        break;
-    #include "llvm/Frontend/ARTS/ARTSKinds.def"
+#define ARTS_RTL(Enum, Str, IsVarArg, ReturnType, ...)                         \
+  case Enum:                                                                   \
+    FnTy = FunctionType::get(ReturnType, ArrayRef<Type *>{__VA_ARGS__},        \
+                             IsVarArg);                                        \
+    Fn = M.getFunction(Str);                                                   \
+    break;
+#include "llvm/Frontend/ARTS/ARTSKinds.def"
   }
 
   if (!Fn) {
     // Create a new declaration if we need one.
     switch (FnID) {
-      #define ARTS_RTL(Enum, Str, ...)                                                \
-        case Enum:                                                                   \
-          Fn = Function::Create(FnTy, GlobalValue::ExternalLinkage, Str, M);         \
-          break;
-      #include "llvm/Frontend/ARTS/ARTSKinds.def"
+#define ARTS_RTL(Enum, Str, ...)                                               \
+  case Enum:                                                                   \
+    Fn = Function::Create(FnTy, GlobalValue::ExternalLinkage, Str, M);         \
+    break;
+#include "llvm/Frontend/ARTS/ARTSKinds.def"
     }
 
     LLVM_DEBUG(dbgs() << "Created ARTS runtime function " << Fn->getName()
@@ -109,25 +109,25 @@ void ARTSIRBuilder::initialize() {
   LLVM_DEBUG(dbgs() << TAG << "Initializing ARTSIRBuilder\n");
   // Initialize the module with the runtime functions.
   initializeTypes();
-  LLVM_DEBUG(dbgs() << TAG  << "ARTSIRBuilder initialized\n");
+  LLVM_DEBUG(dbgs() << TAG << "ARTSIRBuilder initialized\n");
 }
 
 void ARTSIRBuilder::finalize() {
-  LLVM_DEBUG(dbgs() << TAG  << "Finalizing ARTSIRBuilder\n");
+  LLVM_DEBUG(dbgs() << TAG << "Finalizing ARTSIRBuilder\n");
   // Finalize the module with the runtime functions.
   // finalizeModule(M);
-  LLVM_DEBUG(dbgs() << TAG  << "ARTSIRBuilder finalized\n");
+  LLVM_DEBUG(dbgs() << TAG << "ARTSIRBuilder finalized\n");
 }
 
 AllocaInst *ARTSIRBuilder::reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node) {
   auto OldInsertPoint = Builder.saveIP();
   Builder.SetInsertPoint(EntryBB);
   /// Create the call to reserve the GUID
-  ConstantInt *ARTS_EDT_Enum = ConstantInt::get(Builder.getContext(), APInt(32, 1));
-  Value *Args[] = {
-      ARTS_EDT_Enum,
-      Builder.CreateIntCast(ConstantInt::get(Int32, Node), Int32, /*isSigned*/ false)
-  };
+  ConstantInt *ARTS_EDT_Enum =
+      ConstantInt::get(Builder.getContext(), APInt(32, 1));
+  Value *Args[] = {ARTS_EDT_Enum,
+                   Builder.CreateIntCast(ConstantInt::get(Int32, Node), Int32,
+                                         /*isSigned*/ false)};
   CallInst *ReserveGuidCall = Builder.CreateCall(
       getOrCreateRuntimeFunctionPtr(ARTSRTL_artsReserveGuidRoute), Args);
   /// Create allocation of the GUID
@@ -138,10 +138,20 @@ AllocaInst *ARTSIRBuilder::reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node) {
   return GuidAddr;
 }
 
+void ARTSIRBuilder::insertEDTBlock(EDTBlock *EB, Function *EDTFunc) {
+  LLVM_DEBUG(dbgs() << TAG << "Inserting EDT Block\n");
+  auto *BB = EB->BB;
+  /// Detach BB from its parent
+  BB->removeFromParent();
+  /// Attach BB to the EDT Func
+  BB->insertInto(EDTFunc);
+}
+
 Function *ARTSIRBuilder::createEDT(StringRef Name) {
-  LLVM_DEBUG(dbgs() << TAG <<  "Creating EDT\n");
+  LLVM_DEBUG(dbgs() << TAG << "Creating EDT\n");
   // StringRef FuncName = Name + ".edt";
-  Function *Func = Function::Create(EdtFunction, GlobalValue::InternalLinkage, Name, M);
+  Function *Func =
+      Function::Create(EdtFunction, GlobalValue::InternalLinkage, Name, M);
   /// Add entry BB that returns void
   BasicBlock *EntryBB = BasicBlock::Create(Builder.getContext(), "entry", Func);
   Builder.SetInsertPoint(EntryBB);
@@ -149,25 +159,26 @@ Function *ARTSIRBuilder::createEDT(StringRef Name) {
   return Func;
 }
 
-Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBlock *CurBB) {
+Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc,
+                                       BasicBlock *CurBB) {
   auto &DE = EI.DE;
-  LLVM_DEBUG(dbgs() << TAG <<  "Creating EDT \n");
+  LLVM_DEBUG(dbgs() << TAG << "Creating EDT \n");
   /// Get CurBB parent
   Function *Func = CurBB->getParent();
-  LLVM_DEBUG(dbgs() << TAG <<  "CurBB parent: " << Func->getName() << "\n");
-  /// Generate entry region. 
+  LLVM_DEBUG(dbgs() << TAG << "CurBB parent: " << Func->getName() << "\n");
+  /// Generate entry region.
   /// This region will have the declarations of the GUIDs.
-  BasicBlock *EntryBB = BasicBlock::Create(Builder.getContext(), "edt.entry", Func);
+  BasicBlock *EntryBB =
+      BasicBlock::Create(Builder.getContext(), "edt.entry", Func);
   StringRef BBNameAppend = "";
-  if(CurBB) {
+  if (CurBB) {
     /// Create a copy of CurBB terminator
     Instruction *Term = CurBB->getTerminator();
-    if(!Term) {
-      LLVM_DEBUG(dbgs() << TAG <<  "CurBB has no terminator\n");
+    if (!Term) {
+      LLVM_DEBUG(dbgs() << TAG << "CurBB has no terminator\n");
       // return nullptr;
-    }
-    else
-      LLVM_DEBUG(dbgs() << TAG <<  "CurBB has terminator: " << *Term << "\n");
+    } else
+      LLVM_DEBUG(dbgs() << TAG << "CurBB has terminator: " << *Term << "\n");
     // redirectTo(CurBB, EntryBB);
     BBNameAppend = CurBB->getName();
     EntryBB->setName("edt.entry." + BBNameAppend);
@@ -175,8 +186,8 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBloc
   /// Reserve the GUIDs for the EDTs
   AllocaInst *GuidAddr = reserveEDTGuid(EntryBB, 0);
   /// Create EDT body
-  BasicBlock *BodyBB = BasicBlock::Create(
-    Builder.getContext(), "edt.body." + BBNameAppend, Func);
+  BasicBlock *BodyBB = BasicBlock::Create(Builder.getContext(),
+                                          "edt.body." + BBNameAppend, Func);
   Builder.SetInsertPoint(BodyBB);
   /// Branch to the body
   redirectTo(EntryBB, BodyBB);
@@ -189,7 +200,8 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBloc
 
   /// Paramv are the static parameters that are copied into the EDT closure.
   /// It corresponds to the private variables.
-  AllocaInst *ParamVArray = Builder.CreateAlloca(Int64Ptr, nullptr, "paramv.array");
+  AllocaInst *ParamVArray =
+      Builder.CreateAlloca(Int64Ptr, nullptr, "paramv.array");
   for (auto En : enumerate(DE.FirstprivateVars)) {
     unsigned Index = En.index();
     Value *Val = En.value();
@@ -204,9 +216,8 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBloc
       Builder.CreateStore(CI, Val);
     }
     /// Cast the value to int64
-    Value *Casted =
-        Builder.CreateBitCast(Val, Int64Ptr, 
-                              "paramv.val." + Twine(Index) + ".casted");
+    Value *Casted = Builder.CreateBitCast(
+        Val, Int64Ptr, "paramv.val." + Twine(Index) + ".casted");
     Builder.CreateStore(Casted, ParamVArrayElemPtr);
   }
 
@@ -217,18 +228,18 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBloc
   Builder.CreateStore(ConstantInt::get(Int32, NumDepC), DepC);
 
   /// Insert call to artsEdtCreateWithGuid
-  // Function *EDTFunc = Function::Create(EdtFunction, 
-  //                                      GlobalValue::ExternalLinkage, FuncName, M);
-  Value *Args[] = {
-    Builder.CreateBitCast(EDTFunc, EdtFunctionPtr),
-    Builder.CreateBitCast(GuidAddr, Int32Ptr),
-    Builder.CreateLoad(Int32, ParamC),
-    Builder.CreateBitCast(ParamVArray, Int64Ptr),
-    Builder.CreateLoad(Int32, DepC)
-  };
-  
+  // Function *EDTFunc = Function::Create(EdtFunction,
+  //                                      GlobalValue::ExternalLinkage,
+  //                                      FuncName, M);
+  Value *Args[] = {Builder.CreateBitCast(EDTFunc, EdtFunctionPtr),
+                   Builder.CreateBitCast(GuidAddr, Int32Ptr),
+                   Builder.CreateLoad(Int32, ParamC),
+                   Builder.CreateBitCast(ParamVArray, Int64Ptr),
+                   Builder.CreateLoad(Int32, DepC)};
+
   Function *F = getOrCreateRuntimeFunctionPtr(ARTSRTL_artsEdtCreateWithGuid);
-  LLVM_DEBUG(dbgs() << TAG <<  "Creating call to artsEdtCreateWithGuid: \n"<< *F << "\n");
+  LLVM_DEBUG(dbgs() << TAG << "Creating call to artsEdtCreateWithGuid: \n"
+                    << *F << "\n");
   Builder.CreateCall(F, Args);
   return nullptr;
 }
@@ -237,20 +248,20 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc, BasicBloc
 void ARTSIRBuilder::initializeTypes() {
   LLVMContext &Ctx = M.getContext();
   StructType *T;
-  #define ARTS_TYPE(VarName, InitValue) VarName = InitValue;
-  #define ARTS_ARRAY_TYPE(VarName, ElemTy, ArraySize)                             \
-    VarName##Ty = ArrayType::get(ElemTy, ArraySize);                             \
-    VarName##PtrTy = PointerType::getUnqual(VarName##Ty);
-  #define ARTS_FUNCTION_TYPE(VarName, IsVarArg, ReturnType, ...)                  \
-    VarName = FunctionType::get(ReturnType, {__VA_ARGS__}, IsVarArg);            \
-    VarName##Ptr = PointerType::getUnqual(VarName);
-  #define ARTS_STRUCT_TYPE(VarName, StructName, Packed, ...)                      \
-    T = StructType::getTypeByName(Ctx, StructName);                              \
-    if (!T)                                                                      \
-      T = StructType::create(Ctx, {__VA_ARGS__}, StructName, Packed);            \
-    VarName = T;                                                                 \
-    VarName##Ptr = PointerType::getUnqual(T);
-  #include "llvm/Frontend/ARTS/ARTSKinds.def"
+#define ARTS_TYPE(VarName, InitValue) VarName = InitValue;
+#define ARTS_ARRAY_TYPE(VarName, ElemTy, ArraySize)                            \
+  VarName##Ty = ArrayType::get(ElemTy, ArraySize);                             \
+  VarName##PtrTy = PointerType::getUnqual(VarName##Ty);
+#define ARTS_FUNCTION_TYPE(VarName, IsVarArg, ReturnType, ...)                 \
+  VarName = FunctionType::get(ReturnType, {__VA_ARGS__}, IsVarArg);            \
+  VarName##Ptr = PointerType::getUnqual(VarName);
+#define ARTS_STRUCT_TYPE(VarName, StructName, Packed, ...)                     \
+  T = StructType::getTypeByName(Ctx, StructName);                              \
+  if (!T)                                                                      \
+    T = StructType::create(Ctx, {__VA_ARGS__}, StructName, Packed);            \
+  VarName = T;                                                                 \
+  VarName##Ptr = PointerType::getUnqual(T);
+#include "llvm/Frontend/ARTS/ARTSKinds.def"
 }
 
 /// ---------------------------- Utils ---------------------------- ///

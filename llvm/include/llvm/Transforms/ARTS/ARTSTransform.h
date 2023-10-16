@@ -1,20 +1,21 @@
 #ifndef LLVM_TRANSFORMS_ARTS_H
 #define LLVM_TRANSFORMS_ARTS_H
 
-#include "llvm/Transforms/IPO/Attributor.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Transforms/IPO/Attributor.h"
 
 namespace llvm {
 
-
-/// ---------------------------- DATA ENVIRONMENT ---------------------------- ///
-/// Struct to store information about the data environment of the OpenMP regions
+/// DATA ENVIRONMENT
+/// Struct to store information about the data environment of the OpenMP
+/// regions
 struct DataEnv {
-  /// ---------------------------- Interface ---------------------------- ///
-  DataEnv() {};
-  DataEnv(DataEnv &DE) { append(DE);};
+  /// Interface 
+  DataEnv(){};
+  DataEnv(DataEnv &DE) { append(DE); };
   DataEnv &operator=(const DataEnv &DE) {
     PrivateVars = DE.PrivateVars;
     SharedVars = DE.SharedVars;
@@ -26,11 +27,13 @@ struct DataEnv {
   void append(const DataEnv &DE) {
     PrivateVars.append(DE.PrivateVars.begin(), DE.PrivateVars.end());
     SharedVars.append(DE.SharedVars.begin(), DE.SharedVars.end());
-    FirstprivateVars.append(DE.FirstprivateVars.begin(), DE.FirstprivateVars.end());
-    LastprivateVars.append(DE.LastprivateVars.begin(), DE.LastprivateVars.end());
+    FirstprivateVars.append(DE.FirstprivateVars.begin(),
+                            DE.FirstprivateVars.end());
+    LastprivateVars.append(DE.LastprivateVars.begin(),
+                           DE.LastprivateVars.end());
   };
 
-  /// ---------------------------- Attributes ---------------------------- ///
+  /// Attributes 
   SmallVector<Value *, 4> PrivateVars;
   SmallVector<Value *, 4> SharedVars;
   SmallVector<Value *, 4> FirstprivateVars;
@@ -40,22 +43,22 @@ struct DataEnv {
 inline raw_ostream &operator<<(raw_ostream &OS, DataEnv &DE) {
   OS << "Data environment: \n";
   OS << "Firstprivate: " << DE.FirstprivateVars.size() << "\n";
-  for(auto *V : DE.FirstprivateVars)
+  for (auto *V : DE.FirstprivateVars)
     OS << "  - " << *V << "\n";
   OS << "Private: " << DE.PrivateVars.size() << "\n";
-  for(auto *V : DE.PrivateVars)
+  for (auto *V : DE.PrivateVars)
     OS << "  - " << *V << "\n";
   OS << "Shared: " << DE.SharedVars.size() << "\n";
-  for(auto *V : DE.SharedVars)
+  for (auto *V : DE.SharedVars)
     OS << "  - " << *V << "\n";
   OS << "Lastprivate: " << DE.LastprivateVars.size() << "\n";
-  for(auto *V : DE.LastprivateVars)
+  for (auto *V : DE.LastprivateVars)
     OS << "  - " << *V << "\n";
   OS << "\n";
   return OS;
 }
 
-/// ---------------------------- OMP INFO ---------------------------- ///
+/// OMP INFO 
 /// Struct to store information about OpenMP regions
 struct OMPInfo {
   enum RTFType {
@@ -69,12 +72,10 @@ struct OMPInfo {
     SET_NUM_THREADS
   };
 
-  /// ---------------------------- Interface ---------------------------- ///
-  OMPInfo() : RTF(OTHER), CB(nullptr), F(nullptr) {};
-  OMPInfo(OMPInfo &OI) 
-    : RTF(OI.RTF), DE(OI.DE), CB(OI.CB), F(OI.F) {};
-  OMPInfo(RTFType RTF, CallBase *CB) 
-    : RTF(RTF), CB(CB), F(nullptr) {};
+  /// Interface 
+  OMPInfo() : RTF(OTHER), CB(nullptr), F(nullptr){};
+  OMPInfo(OMPInfo &OI) : RTF(OI.RTF), DE(OI.DE), CB(OI.CB), F(OI.F){};
+  OMPInfo(RTFType RTF, CallBase *CB) : RTF(RTF), CB(CB), F(nullptr){};
   OMPInfo &operator=(const OMPInfo &OI) {
     RTF = OI.RTF;
     DE = OI.DE;
@@ -82,30 +83,30 @@ struct OMPInfo {
     F = OI.F;
     return *this;
   }
-  /// ---------------------------- Attributes ---------------------------- ///
+  /// Attributes 
   RTFType RTF;
   DataEnv DE;
-  CallBase *CB;         // CallBase of the OpenMP region
-  Function *F;          // Pointer to the outlined function
+  CallBase *CB; // CallBase of the OpenMP region
+  Function *F;  // Pointer to the outlined function
 
-  /// ---------------------------- Helper Functions ---------------------------- ///
+  /// Helper Functions
   static RTFType getRTFunction(Function *F) {
-    if(!F)
+    if (!F)
       return RTFType::OTHER;
-    auto calleeName = F->getName();
-    if(calleeName == "__kmpc_fork_call")
+    auto CalleeName = F->getName();
+    if (CalleeName == "__kmpc_fork_call")
       return RTFType::PARALLEL;
-    else if(calleeName == "__kmpc_omp_task_alloc")
+    if (CalleeName == "__kmpc_omp_task_alloc")
       return RTFType::TASKALLOC;
-    else if(calleeName == "__kmpc_omp_task")
+    if (CalleeName == "__kmpc_omp_task")
       return RTFType::TASK;
-    else if(calleeName == "__kmpc_omp_task_alloc_with_deps")
+    if (CalleeName == "__kmpc_omp_task_alloc_with_deps")
       return RTFType::TASKDEP;
-    else if(calleeName == "__kmpc_omp_taskwait")
+    if (CalleeName == "__kmpc_omp_taskwait")
       return RTFType::TASKWAIT;
-    else if(calleeName == "omp_set_num_threads")
+    if (CalleeName == "omp_set_num_threads")
       return RTFType::SET_NUM_THREADS;
-    else if(calleeName == "__kmpc_for_static_init_4")
+    if (CalleeName == "__kmpc_for_static_init_4")
       return RTFType::PARALLEL_FOR;
     return RTFType::OTHER;
   }
@@ -115,84 +116,83 @@ struct OMPInfo {
     return getRTFunction(Callee);
   }
 
+  static RTFType getRTFunction(Instruction *I) {
+    auto *CB = dyn_cast<CallBase>(I);
+    if (!CB)
+      return RTFType::OTHER;
+    return getRTFunction(*CB);
+  }
+
   static bool isTaskFunction(Function *F) {
     auto RT = getRTFunction(F);
-    if(RT == RTFType::TASK || RT == RTFType::TASKDEP || RT == RTFType::TASKWAIT )
+    if (RT == RTFType::TASK || RT == RTFType::TASKDEP ||
+        RT == RTFType::TASKWAIT)
       return true;
     return false;
   }
 
   const StringRef getCBName() const {
-    if(CB)
+    if (CB)
       return CB->getCalledFunction()->getName();
     return "";
   }
 
   const StringRef getFName() const {
-    if(F)
+    if (F)
       return F->getName();
     return "";
   }
 
   const Function *getCBFunction() const {
-    if(CB)
+    if (CB)
       return CB->getCalledFunction();
     return nullptr;
   }
 };
 
-/// ---------------------------- EDT DEP ---------------------------- ///
+/// EDT DEP 
 struct EDTInfo;
 struct EDTDep {
-  /// ---------------------------- Interface ---------------------------- ///
-  EDTDep() : EDT(nullptr) {};
-  EDTDep(EDTInfo *EDT) : EDT(EDT) {};
+  /// Interface 
+  EDTDep() : EDT(nullptr){};
+  EDTDep(EDTInfo *EDT) : EDT(EDT){};
   // EDTDep(EDTInfo *EDT, DataEnv *DE) : EDT(EDT), DE(DE) {};
 
-  /// ---------------------------- Attributes ---------------------------- ///
+  /// Attributes 
   // EDT where the value will be signaled to
   EDTInfo *EDT;
   /// Values to be signaled
-  SmallVector<Value*, 4> values;
+  SmallVector<Value *, 4> Values;
 };
 
-/// ---------------------------- EDT INFO ---------------------------- ///
+/// EDT INFO 
 struct EDTBlock {
-  enum BlockType {
-    ENTRY = 0,
-    INIT_ALLOCA,
-    INIT,
-    EVENT,
-    OTHER
-  };
-  /// ---------------------------- Interface ---------------------------- ///
-  EDTBlock(EDTInfo *EDT) : EDT(EDT), Type(OTHER), BB(nullptr) {};
-  EDTBlock(EDTInfo *EDT, BlockType Type, BasicBlock *BB) 
-          : EDT(EDT), Type(Type), BB(BB) {};
-  EDTBlock(EDTBlock &B) 
-          : EDT(B.EDT), Type(B.Type), BB(B.BB) {};
+  enum BlockType { ENTRY = 0, INIT_ALLOCA, INIT, EVENT, OTHER };
+  /// Interface 
+  EDTBlock(EDTInfo *EDT) : EDT(EDT), Type(OTHER), BB(nullptr){};
+  EDTBlock(EDTInfo *EDT, BlockType Type, BasicBlock *BB)
+      : EDT(EDT), Type(Type), BB(BB){};
+  EDTBlock(EDTBlock &B) : EDT(B.EDT), Type(B.Type), BB(B.BB){};
 
   void setOMPInfo(OMPInfo &OMPI) {
     HasOMP = true;
     OMP = OMPI;
   }
 
-  bool isInSameEDT(EDTBlock &B) {
-    return (EDT == B.EDT);
-  }
+  bool isInSameEDT(EDTBlock &B) { return (EDT == B.EDT); }
 
-  bool isInit() {
-    return (Type == INIT);
-  }
+  bool isInit() { return (Type == INIT); }
+  bool isEntry() { return (Type == ENTRY); }
+  bool isOther() { return (Type == OTHER); }
 
-  /// ---------------------------- Attributes ---------------------------- ///
+  /// Attributes 
   /// Pointer to EDT where the EDTBlock belongs
   EDTInfo *EDT;
   /// Type of the EDTBlock
   BlockType Type;
   /// BasicBlock of the EDTBlock
   BasicBlock *BB;
-  /// Flag to indicate if the EDT has OpenMP RT calls 
+  /// Flag to indicate if the EDT has OpenMP RT calls
   bool HasOMP = false;
   /// OpenMP information of the EDT
   OMPInfo OMP;
@@ -207,31 +207,30 @@ inline raw_ostream &operator<<(raw_ostream &OS, EDTBlock &EB) {
   OS << "-- EDTBlock --\n";
   OS << "  - BB Name: " << EB.BB->getName() << "\n";
   OS << "  - Block Type: ";
-  if(EB.Type == EDTBlock::INIT_ALLOCA)
+  if (EB.Type == EDTBlock::INIT_ALLOCA)
     OS << "Init Alloca";
-  else if(EB.Type == EDTBlock::INIT)
+  else if (EB.Type == EDTBlock::INIT)
     OS << "Init";
-  else if(EB.Type == EDTBlock::EVENT)
+  else if (EB.Type == EDTBlock::EVENT)
     OS << "Event";
-  else if(EB.Type == EDTBlock::ENTRY)
+  else if (EB.Type == EDTBlock::ENTRY)
     OS << "Entry";
   else
     OS << "Other";
   OS << "\n";
-  auto HasOMP = EB.HasOMP ? "True" : "False";
+  const char *HasOMP = EB.HasOMP ? "True" : "False";
   OS << "  - OMP: " << HasOMP << "\n";
   OS << "  - Transformed: " << Transformed;
   OS << *EB.BB;
   return OS;
 }
 
-/// ---------------------------- EDT INFO ---------------------------- ///
+/// EDT INFO 
 /// Struct to store information about EDTs
 struct EDTInfo {
-  /// ---------------------------- Interface ---------------------------- ///
-  EDTInfo(uint64_t ID) : ID(ID) {};
-  EDTInfo(uint64_t ID, Function *F, DataEnv DE) 
-        : ID(ID), F(F), DE(DE) {};
+  /// Interface 
+  EDTInfo(uint64_t ID) : ID(ID){};
+  EDTInfo(uint64_t ID, Function *F, DataEnv DE) : ID(ID), F(F), DE(DE){};
 
   EDTBlock *insertEDTBlock(EDTBlock Block) {
     EDTBlock *EDTB = new EDTBlock(Block);
@@ -245,11 +244,11 @@ struct EDTInfo {
     return EDTB;
   }
 
-  void addDep(EDTDep *SI) {
-    Deps.insert(SI);
-  }
+  void addDep(EDTDep *SI) { Deps.insert(SI); }
 
-  /// ---------------------------- Attributes ---------------------------- ///
+  void setF(Function *F) { this->F = F; }
+
+  /// Attributes 
   /// GUID of the EDT
   uint64_t ID;
   /// Pointer to the EDT function
@@ -267,38 +266,34 @@ struct EDTInfo {
   /// Set of instructions that may read or write to memory
   SmallPtrSet<Instruction *, 4> RWInsts;
   /// Set of used instructions with values not declared in the EDT
-  SmallPtrSet<Instruction *, 4> ExternalValues;
+  SmallPtrSet<Instruction *, 4> ExtInsts;
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS, EDTInfo &EI) {
   OS << "----- EDT -----\n";
   OS << "ID: " << EI.ID << "\n";
   OS << "Number of Deps: " << EI.Deps.size() << "\n";
-  for(auto *Dep : EI.Deps){
+  for (auto *Dep : EI.Deps) {
     OS << "  - " << Dep->EDT->ID << "\n";
   }
   OS << "Number of RWInsts: " << EI.RWInsts.size() << "\n";
-  for(auto *I : EI.RWInsts) {
-    // OS << "  - " << I << "\n";
-    // if(auto *CB = dyn_cast<CallBase>(I))
-    //   OS << "  - " << CB->getCalledFunction()->getName() << "\n";
-    // else
-      OS << "  - " << *I << "\n";
+  for (auto *I : EI.RWInsts) {
+    OS << "  - " << *I << "\n";
   }
-  OS << "Number of ExternalValues: " << EI.ExternalValues.size() << "\n";
-  for(auto *I : EI.ExternalValues) {
+  OS << "Number of ExtInsts: " << EI.ExtInsts.size() << "\n";
+  for (auto *I : EI.ExtInsts) {
     OS << "  - " << *I << "\n";
   }
   OS << "Number of Blocks: " << EI.Blocks.size() << "\n";
-  for(auto *B : EI.Blocks) {
+  for (auto *B : EI.Blocks) {
     OS << *B << "\n";
   }
   return OS;
 }
 
-/// ---------------------------- ARTS TRANSFORM ---------------------------- ///
+/// ARTS TRANSFORM 
 struct ARTSTransformer {
-  /// ---------------------------- Interface ---------------------------- ///
+  /// Interface 
   ARTSTransformer(Module &M) : M(M) {}
   ~ARTSTransformer() {
     /// Delete EDTs
@@ -309,13 +304,13 @@ struct ARTSTransformer {
   bool run(Attributor &A);
   bool runAttributor(Attributor &A);
 
-  /// ---------------------------- Helper Functions ---------------------------- ///
-  /// Insert EDT
+  /// Helper Functions 
+  /// /// Insert EDT
   EDTInfo *insertEDT(Function *F, EDTBlock *Init = nullptr) {
     EDTInfo *EDTI = new EDTInfo(EDTID++);
-    if(Init) {
-      assert(Init->Type == EDTBlock::BlockType::INIT 
-             && "Init block must be of type INIT");
+    if (Init) {
+      assert(Init->Type == EDTBlock::BlockType::INIT &&
+             "Init block must be of type INIT");
       EDTI->Init = Init;
     }
     EDTs.insert(EDTI);
@@ -329,7 +324,7 @@ struct ARTSTransformer {
     From->addDep(SI);
   }
 
-  /// ---------------------------- EDTBlock Map ---------------------------- ///
+  /// EDTBlock Map 
   /// Return the EDTBlock for a given BB or `nullptr` if there are
   /// none.
   EDTBlock *getEDTBlock(BasicBlock *BB) {
@@ -339,13 +334,11 @@ struct ARTSTransformer {
     return nullptr;
   }
 
-  EDTBlock *getEDTBlock(Instruction *I) {
-    return getEDTBlock(I->getParent());
-  }
+  EDTBlock *getEDTBlock(Instruction *I) { return getEDTBlock(I->getParent()); }
 
   /// Create EDTBlock and insert it into the EDT and map
-  EDTBlock *insertEDTBlock(
-      EDTInfo *EI, EDTBlock::BlockType Ty, BasicBlock *BB) {
+  EDTBlock *insertEDTBlock(EDTInfo *EI, EDTBlock::BlockType Ty,
+                           BasicBlock *BB) {
     /// Insert EDT block
     EDTBlock *EDTB = EI->insertEDTBlock(Ty, BB);
     /// Add it to the map
@@ -358,8 +351,8 @@ struct ARTSTransformer {
   }
 
   /// Create EDTBlock and insert it into the EDT and map
-  EDTBlock *insertEDTBlock(EDTInfo *EI, EDTBlock::BlockType Ty,
-                           BasicBlock *BB, OMPInfo &OMP) {
+  EDTBlock *insertEDTBlock(EDTInfo *EI, EDTBlock::BlockType Ty, BasicBlock *BB,
+                           OMPInfo &OMP) {
     EDTBlock *EDTB = insertEDTBlock(EI, Ty, BB);
     EDTB->setOMPInfo(OMP);
     return EDTB;
@@ -378,14 +371,14 @@ struct ARTSTransformer {
     EDTForFunction.insert(std::make_pair(F, EDTI));
   }
 
-  /// ---------------------------- RWInsts Map ---------------------------- ///
+  /// RWInsts Map 
   void insertRWInst(Function *F, Instruction *I) {
     RWInsts[F].insert(I);
     EDTBlock *EDTB = getEDTBlock(I);
     EDTB->EDT->RWInsts.insert(I);
   }
 
-  /// ---------------------------- Attributes ---------------------------- ///
+  /// Attributes 
   /// The underlying module.
   Module &M;
   /// Set of valid functions in the module.
@@ -408,18 +401,18 @@ struct ARTSTransformer {
   DenseMap<Function *, SmallPtrSet<Instruction *, 4>> RWInsts;
 };
 
-inline raw_ostream &operator<<
-    (raw_ostream &OS, SmallPtrSet<EDTInfo*, 4> &EDTs) {
+inline raw_ostream &operator<<(raw_ostream &OS,
+                               SmallPtrSet<EDTInfo *, 4> &EDTs) {
   OS << "DUMPING EDTs\n";
   OS << "Number of EDTs: " << EDTs.size() << "\n";
-  for(auto *E : EDTs) {
+  for (auto *E : EDTs) {
     OS << "\n" << *E;
   }
   return OS;
 }
 
-/// ---------------------------- ARTS TRANSFORM PASS ---------------------------- ///
-/// From OpenMP to ARTS transformation pass.
+/// ARTS TRANSFORM PASS
+///  From OpenMP to ARTS transformation pass.
 class ARTSTransformPass : public PassInfoMixin<ARTSTransformPass> {
 public:
   ARTSTransformPass() = default;
