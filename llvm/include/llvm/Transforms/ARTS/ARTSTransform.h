@@ -184,6 +184,7 @@ struct EDTBlock {
   bool isInit() { return (Type == INIT); }
   bool isEntry() { return (Type == ENTRY); }
   bool isOther() { return (Type == OTHER); }
+  bool isInitAlloca() { return (Type == INIT_ALLOCA); }
 
   /// Attributes 
   /// Pointer to EDT where the EDTBlock belongs
@@ -196,6 +197,7 @@ struct EDTBlock {
   bool HasOMP = false;
   /// OpenMP information of the EDT
   OMPInfo OMP;
+
   /// Flag to indicate if the EDTBlock was Transformed
   bool Transformed = false;
   /// Flag to indicate if the EDTBlock was Analyzed
@@ -232,14 +234,11 @@ struct EDTInfo {
   EDTInfo(uint64_t ID) : ID(ID){};
   EDTInfo(uint64_t ID, Function *F, DataEnv DE) : ID(ID), F(F), DE(DE){};
 
-  EDTBlock *insertEDTBlock(EDTBlock Block) {
-    EDTBlock *EDTB = new EDTBlock(Block);
-    Blocks.insert(EDTB);
-    return EDTB;
-  }
-
   EDTBlock *insertEDTBlock(EDTBlock::BlockType Ty, BasicBlock *BB) {
     EDTBlock *EDTB = new EDTBlock(this, Ty, BB);
+    if(Ty == EDTBlock::INIT_ALLOCA)
+      InitAlloca = EDTB;
+    /// Add it to the map
     Blocks.insert(EDTB);
     return EDTB;
   }
@@ -255,8 +254,11 @@ struct EDTInfo {
   Function *F = nullptr;
   /// Data environment of the EDT
   DataEnv DE;
-  /// Init EDTBlock
+  /// Pointer to Init EDTBlock. It is used to know who created the EDT
   EDTBlock *Init = nullptr;
+  /// Pointer to InitAlloca EDTBlock. It is used to know where to create
+  /// the GUIDs.
+  EDTBlock *InitAlloca = nullptr;
   /// Indicates if the EDT was analyzed or not
   bool Analyzed = false;
   /// List of EDT Dependencies - successors
@@ -305,7 +307,7 @@ struct ARTSTransformer {
   bool runAttributor(Attributor &A);
 
   /// Helper Functions 
-  /// /// Insert EDT
+  /// Insert EDT
   EDTInfo *insertEDT(Function *F, EDTBlock *Init = nullptr) {
     EDTInfo *EDTI = new EDTInfo(EDTID++);
     if (Init) {
@@ -324,7 +326,7 @@ struct ARTSTransformer {
     From->addDep(SI);
   }
 
-  /// EDTBlock Map 
+  /// EDTBlock helper functions. 
   /// Return the EDTBlock for a given BB or `nullptr` if there are
   /// none.
   EDTBlock *getEDTBlock(BasicBlock *BB) {

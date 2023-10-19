@@ -20,6 +20,7 @@
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Frontend/ARTS/ARTSConstants.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constant.h"
@@ -34,6 +35,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/ARTS/ARTSTransform.h"
 // #include "llvm/MC/TargetRegistry.h"
 // #include "llvm/Support/CommandLine.h"
 // #include "llvm/Support/ErrorHandling.h"
@@ -144,14 +146,23 @@ void ARTSIRBuilder::insertEDTBlock(EDTBlock *EB, Function *EDTFunc) {
   /// Detach BB from its parent
   BB->removeFromParent();
   /// Attach BB to the EDT Func
+  if(EB->isEntry()) {
+    /// Remove entry block
+    BasicBlock *EntryBB = &EDTFunc->getEntryBlock();
+    EntryBB->removeFromParent();
+  }
   BB->insertInto(EDTFunc);
+  /// Redirect last BB to BB
+  BasicBlock *LastBB = &EDTFunc->back();
+  if(LastBB != BB)
+    redirectTo(LastBB, BB);
 }
 
 Function *ARTSIRBuilder::createEDT(StringRef Name) {
-  LLVM_DEBUG(dbgs() << TAG << "Creating EDT\n");
-  // StringRef FuncName = Name + ".edt";
+  const std::string FuncName = (Name + ".edt").str();
+  LLVM_DEBUG(dbgs() << TAG << "Creating EDT: " << FuncName << "\n");
   Function *Func =
-      Function::Create(EdtFunction, GlobalValue::InternalLinkage, Name, M);
+      Function::Create(EdtFunction, GlobalValue::InternalLinkage, FuncName, M);
   /// Add entry BB that returns void
   BasicBlock *EntryBB = BasicBlock::Create(Builder.getContext(), "entry", Func);
   Builder.SetInsertPoint(EntryBB);
@@ -162,7 +173,6 @@ Function *ARTSIRBuilder::createEDT(StringRef Name) {
 Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc,
                                        BasicBlock *CurBB) {
   auto &DE = EI.DE;
-  LLVM_DEBUG(dbgs() << TAG << "Creating EDT \n");
   /// Get CurBB parent
   Function *Func = CurBB->getParent();
   LLVM_DEBUG(dbgs() << TAG << "CurBB parent: " << Func->getName() << "\n");

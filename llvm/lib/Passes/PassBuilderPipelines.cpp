@@ -1052,9 +1052,6 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   // (quick!) no-op if there are no OpenMP runtime calls present in the module.
   MPM.addPass(OpenMPOptPass());
 
-  // Run ARTSTransformPass after OpenMPOptPass
-  MPM.addPass(ARTSTransformPass());
-
   if (AttributorRun & AttributorRunOption::MODULE)
     MPM.addPass(AttributorPass());
 
@@ -1132,6 +1129,9 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   // Optimize globals now that functions are fully simplified.
   MPM.addPass(GlobalOptPass());
   MPM.addPass(GlobalDCEPass());
+
+  // Run ARTSTransformPass
+  MPM.addPass(ARTSTransformPass());
 
   return MPM;
 }
