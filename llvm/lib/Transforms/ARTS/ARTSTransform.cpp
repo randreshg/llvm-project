@@ -1,6 +1,7 @@
 
 #include "llvm/Transforms/ARTS/ARTSTransform.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
@@ -14,6 +15,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/Attributor.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/CodeExtractor.h"
 
 #include <optional>
 using namespace llvm;
@@ -417,6 +419,7 @@ const char AADataEnv::ID = 0;
 /// AAToARTS
 /// This AbstractAttribute analyzes a given function and tries to determine
 /// if it can be transformed to ARTS.
+using BlockSequence = SmallVector<BasicBlock *, 0>;
 struct AAToARTS : public StateWrapper<BooleanState, AbstractAttribute> {
   using Base = StateWrapper<BooleanState, AbstractAttribute>;
 
@@ -488,20 +491,100 @@ struct AAToARTSFunction : AAToARTS {
     return true;
   }
 
-  void dominatedBBs(Function &F, BasicBlock *FromBB, DominatorTree &DT) {
+  void dominatedBBs(BasicBlock *FromBB, DominatorTree &DT, BlockSequence &DominatedBlocks) {
     /// This function finds the BBs that are dominated by FromBB and add
     /// them to the DominatedBlocks vector.
-    std::vector<llvm::BasicBlock*> DominatedBlocks;
-    LLVM_DEBUG(dbgs() << "BB " << FromBB->getName()<< ", dominates:\n");
+    Function &F = *FromBB->getParent();
+    // LLVM_DEBUG(dbgs() << "BB " << FromBB->getName()<< ", dominates:\n");
     for (auto &ToBB : F) {
-        if (DT.dominates(FromBB, &ToBB)) {
+        if (DT.dominates(FromBB, &ToBB))
           DominatedBlocks.push_back(&ToBB);
-        }
     }
     /// Then we create an EDT
     // auto *EDT = AT->insertEDT(&F);
     /// Insert all dominated BBs to the EDT
+  }
 
+  /// Given a basic block, this function creates a function that contains
+  /// the instructions of the BB. The function is then inserted to the
+  /// module.
+  Function *createFunction(DominatorTree *DT, BasicBlock *FromBB, 
+                           bool DTAnalysis = false,
+                           SmallVector<Value *, 0> *ExcludeArgsFromAggregate = nullptr) {
+    Function &F = *FromBB->getParent();
+    AssumptionCache *AC = AG->getAnalysis<AssumptionAnalysis>(F, true);
+    CodeExtractorAnalysisCache CEAC(F);
+    /// Collect blocks
+    BlockSequence Region;
+    /// Get all BBs that are dominated by FromBB
+    if(DTAnalysis)
+      dominatedBBs(FromBB, *DT, Region);
+    else
+      Region.push_back(FromBB);
+    LLVM_DEBUG(dbgs() << TAG << "Creating function for: " 
+                      << FromBB->getName() << " - " << Region.size() << "\n");
+    /// Extract code from the region
+    auto FunctionName = "edt." + FromBB->getName().str();
+    CodeExtractor CE(Region, DT, /* AggregateArgs */ false, /* BFI */ nullptr,
+                   /* BPI */ nullptr, AC, /* AllowVarArgs */ true,
+                   /* AllowAlloca */ true, /* AllocaBlock */ nullptr,
+                   /* Suffix */ FunctionName);
+    /// Debug info
+    // SetVector<Value *> Inputs, Outputs, Sinks;
+    // CE.findInputsOutputs(Inputs, Outputs, Sinks);
+    // LLVM_DEBUG(dbgs() << "Inputs\n");
+    // for (auto *I : Inputs) {
+    //   LLVM_DEBUG(dbgs() << *I << "\n");
+    // }
+    // LLVM_DEBUG(dbgs() << "Outputs\n");
+    // for (auto *O : Outputs) {
+    //   LLVM_DEBUG(dbgs() << *O << "\n");
+    // }
+    // LLVM_DEBUG(dbgs() << "Sinks\n");
+    // for (auto *S : Sinks) {
+    //   LLVM_DEBUG(dbgs() << *S << "\n");
+    // }
+    assert(CE.isEligible() &&
+           "Expected Region outlining to be possible!");
+    
+
+    if(ExcludeArgsFromAggregate)
+      for (auto *V : *ExcludeArgsFromAggregate)
+        CE.excludeArgFromAggregate(V);
+    /// Generate function
+    Function *OutF = CE.extractCodeRegion(CEAC);
+    LLVM_DEBUG(dbgs() << "Extracted function: " << *OutF << "\n");
+    return OutF;
+  }
+
+  void analyzeOutlinedRegion(Function &F, SmallVector<Value *, 0> *ArgsToRemove = nullptr) {
+    if (ArgsToRemove) {
+      for (auto *Arg : *ArgsToRemove) {
+        // LLVM_DEBUG(dbgs() << "Removing argument: " << *Arg << "\n");
+        /// Check all uses of the argument
+        for (auto &U : Arg->uses()) {
+          // LLVM_DEBUG(dbgs() << "  -Use: " << *U.getUser() << "\n");
+          /// Convert to instruction
+          auto *I = dyn_cast<Instruction>(U.getUser());
+          if (!I)
+            continue;
+          /// If the argument is used by a call instruction, replace it with a nullptr
+          if (auto *CBI = dyn_cast<CallBase>(I)) {
+            CBI->setArgOperand(U.getOperandNo(), UndefValue::get(Arg->getType()));
+            continue;
+          }
+          /// If it is a load instruction, replace it with 0
+          if (auto *LI = dyn_cast<LoadInst>(I)) {
+            LI->replaceAllUsesWith(ConstantInt::get(LI->getType(), 0));
+            I->eraseFromParent();
+            break;
+          }
+          /// Remove instruction
+          I->replaceAllUsesWith(UndefValue::get(Arg->getType()));
+          I->eraseFromParent();
+        }
+      }
+    }
   }
 
   bool identifyEDTs(Function &F, Attributor &A) {
@@ -544,6 +627,7 @@ struct AAToARTSFunction : AAToARTS {
     /// contains the call to the function that creates the region (e.g.
     /// __kmpc_fork_call) and the Val is the struct EDTInfo. Aux variables
 
+    /// Aux variables
     LoopInfo *LI = nullptr;
     DominatorTree *DT =  AG->getAnalysis<DominatorTreeAnalysis>(F);
 
@@ -556,19 +640,9 @@ struct AAToARTSFunction : AAToARTS {
     /// If function is not IPO amendable, we give up
     if (!A.isFunctionIPOAmendable(F))
       return false;
-    // identifyRegions(F, AG);
 
-     /// Insert a new EDT we haven't created one yet for the function
-    EDTInfo *CurrentEDT = AT->getEDTForFunction(&F);
-    if (!CurrentEDT) {
-      CurrentEDT = AT->insertEDT(&F);
-      /// If it is the main function, insert it to the EDTforFunction map
-      if (F.getName() == "main")
-        AT->insertEDTForFunction(&F, CurrentEDT);
-    }
     /// Get entry block
     BasicBlock *CurrentBB = &(F.getEntryBlock());
-    AT->insertEDTBlock(CurrentEDT, EDTBlock::ENTRY, CurrentBB);
     BasicBlock *NextBB = nullptr;
     do {
       // LLVM_DEBUG(dbgs() << TAG << "CurrentBB: " << *CurrentBB << "\n");
@@ -587,15 +661,11 @@ struct AAToARTSFunction : AAToARTS {
         switch (RTF) {
         case OMPInfo::PARALLEL: {
           OMPInfo OI(OMPInfo::PARALLEL, CB);
+
           /// Split block at __kmpc_parallel
           BasicBlock *ParallelBB =
               SplitBlock(CurrentI->getParent(), CurrentI, DT, LI, nullptr,
                          "par.region." + std::to_string(ParallelRegion));
-          /// Insert EDT block for the parallel init region to current EDT. Then
-          /// create empty EDT for the outlined function and set init block.
-          EDTBlock *ParallelInitBlock =
-              AT->insertEDTBlock(CurrentEDT, EDTBlock::INIT, ParallelBB, OI);
-          EDTInfo *ParallelEDT = AT->insertEDT(&F, ParallelInitBlock);
           /// Split block at the next instruction
           CurrentI = CurrentI->getNextNonDebugInstruction();
           BasicBlock *ParallelDone =
@@ -603,14 +673,22 @@ struct AAToARTSFunction : AAToARTS {
                          "par.done." + std::to_string(ParallelRegion));
           NextBB = ParallelDone;
           ParallelRegion++;
-          /// Get name of nodes dominated by par.done
-          dominatedBBs(F, ParallelDone, *DT);
-          /// Create new EDT and add dependency from current EDT to the new EDT.
-          /// Then, insert EDT block for the parallel done region to the new
-          /// EDT. Finally add dependency from par.region to par.done
-          CurrentEDT = AT->insertEDT(&F);
-          AT->insertEDTBlock(CurrentEDT, EDTBlock::ENTRY, ParallelDone);
-          AT->insertDep(ParallelEDT, CurrentEDT);
+
+          /// Analyze outlined region
+          Function &OutlinedFunction = *dyn_cast<Function>(CB->getArgOperand(2));
+          SmallVector<Value *, 0> ArgsToRemove = {
+            OutlinedFunction.getArg(0), 
+            OutlinedFunction.getArg(1)};
+          analyzeOutlinedRegion(OutlinedFunction, &ArgsToRemove);
+          identifyEDTs(OutlinedFunction, A);
+          LLVM_DEBUG(dbgs() << "Outlined function: " << OutlinedFunction<< "\n");
+          createFunction(DT, &OutlinedFunction.getEntryBlock(), true);
+
+          /// Extract regions and outline them into functions
+          Function *ParallelFunction = createFunction(DT, ParallelBB);
+          /// For the Done function run the analysis again
+          Function *DoneFunction = createFunction(DT, ParallelDone, true);
+          identifyEDTs(*DoneFunction, A);
         } break;
         case OMPInfo::TASKALLOC: {
           OMPInfo OI(OMPInfo::TASK, CB);
@@ -618,13 +696,6 @@ struct AAToARTSFunction : AAToARTS {
           BasicBlock *TaskBB =
               SplitBlock(CurrentI->getParent(), CurrentI, DT, LI, nullptr,
                          "task.region." + std::to_string(TaskRegion));
-          /// Insert EDT block for the task init region to current EDT. Then
-          /// create empty EDT for the outlined function, and add dependency
-          /// from current EDT to the new EDT.
-          EDTBlock *TaskInitBlock =
-              AT->insertEDTBlock(CurrentEDT, EDTBlock::INIT, TaskBB, OI);
-          EDTInfo *TaskEDT = AT->insertEDT(&F, TaskInitBlock);
-          // AT.insertEDTWithDep(CurrentEDT, TaskInitBlock);
           /// Find the task call
           while ((CurrentI = CurrentI->getNextNonDebugInstruction())) {
             auto *TCB = dyn_cast<CallBase>(CurrentI);
@@ -640,12 +711,14 @@ struct AAToARTSFunction : AAToARTS {
                          "task.done." + std::to_string(TaskRegion));
           NextBB = TaskDone;
           TaskRegion++;
-          /// Create new EDT and add dependency from current EDT to the new EDT.
-          /// Then, insert EDT block for the task done region to the new EDT.
-          /// Finally add dependency from task.region to task.done
-          CurrentEDT = AT->insertEDT(&F);
-          AT->insertEDTBlock(CurrentEDT, EDTBlock::ENTRY, TaskDone, OI);
-          AT->insertDep(TaskEDT, CurrentEDT);
+          /// Analyzed outlined region
+          Function &OutlinedFunction = *dyn_cast<Function>(CB->getArgOperand(5));
+          identifyEDTs(OutlinedFunction, A);
+          /// Extract regions and create aux functions
+          createFunction(DT, TaskBB);
+          /// For the Done function run the analysis again
+          Function *DoneFunction = createFunction(DT, TaskDone, true);
+          identifyEDTs(*DoneFunction, A);
         } break;
         case OMPInfo::TASKWAIT: {
           /// \Note A taskwait requires an event.
@@ -788,68 +861,68 @@ struct AAToARTSFunction : AAToARTS {
 
     
 
-    /// Iterate through the EDTs to analyze the EDT with empty number of Blocks
-    LLVM_DEBUG(dbgs() << "\n" << TAG << "EDTs with empty number of Blocks:\n");
-    for (auto *EDT : AT.EDTsFromFunction[F]) {
-      if (EDT->Blocks.size() != 0)
-        continue;
-      LLVM_DEBUG(dbgs() << "EDT #" << EDT->ID << "\n");
-      auto *EDTInit = EDT->Init;
-      assert((EDTInit && EDTInit->HasOMP) && "EDTInit not found");
-      auto &OMP = EDTInit->OMP;
-      LLVM_DEBUG(dbgs() << "  - OMP: " << OMP.F->getName() << "\n");
+    // /// Iterate through the EDTs to analyze the EDT with empty number of Blocks
+    // LLVM_DEBUG(dbgs() << "\n" << TAG << "EDTs with empty number of Blocks:\n");
+    // for (auto *EDT : AT.EDTsFromFunction[F]) {
+    //   if (EDT->Blocks.size() != 0)
+    //     continue;
+    //   LLVM_DEBUG(dbgs() << "EDT #" << EDT->ID << "\n");
+    //   auto *EDTInit = EDT->Init;
+    //   assert((EDTInit && EDTInit->HasOMP) && "EDTInit not found");
+    //   auto &OMP = EDTInit->OMP;
+    //   LLVM_DEBUG(dbgs() << "  - OMP: " << OMP.F->getName() << "\n");
 
-      /// Add it to the EDTForFunction map
-      AT.insertEDTForFunction(OMP.F, EDT);
-      /// Run AAToARTS on the EDTInit function
-      auto *OMPFAA = A.getAAFor<AAToARTS>(*this, IRPosition::function(*OMP.F),
-                                          DepClassTy::OPTIONAL);
-      if (!OMPFAA->getState().isValidState()) {
-        LLVM_DEBUG(dbgs() << "[AAToARTSFunction] OMPFAA is invalid\n");
-        indicatePessimisticFixpoint();
-        return ChangeStatus::CHANGED;
-      }
-      if (!OMPFAA->getState().isAtFixpoint()) {
-        LLVM_DEBUG(dbgs() << "[AAToARTSFunction] OMPFAA is not at fixpoint\n");
-        return ChangeStatus::UNCHANGED;
-      }
-    }
+    //   /// Add it to the EDTForFunction map
+    //   AT.insertEDTForFunction(OMP.F, EDT);
+    //   /// Run AAToARTS on the EDTInit function
+    //   auto *OMPFAA = A.getAAFor<AAToARTS>(*this, IRPosition::function(*OMP.F),
+    //                                       DepClassTy::OPTIONAL);
+    //   if (!OMPFAA->getState().isValidState()) {
+    //     LLVM_DEBUG(dbgs() << "[AAToARTSFunction] OMPFAA is invalid\n");
+    //     indicatePessimisticFixpoint();
+    //     return ChangeStatus::CHANGED;
+    //   }
+    //   if (!OMPFAA->getState().isAtFixpoint()) {
+    //     LLVM_DEBUG(dbgs() << "[AAToARTSFunction] OMPFAA is not at fixpoint\n");
+    //     return ChangeStatus::UNCHANGED;
+    //   }
+    // }
 
-    /// If this is the main function
-    if (F->getName() == "main") {
-      LLVM_DEBUG(dbgs() << TAG
-                        << "----------- PROCESS HAS FINISHED -----------\n");
-      EDTInfo *MainEDT = AT.getEDTForFunction(F);
-      assert(MainEDT && "Main EDT not found");
-      auto &ARTSBuilder = ARTSInfoCache.ARTSBuilder;
+    // /// If this is the main function
+    // if (F->getName() == "main") {
+    //   LLVM_DEBUG(dbgs() << TAG
+    //                     << "----------- PROCESS HAS FINISHED -----------\n");
+    //   EDTInfo *MainEDT = AT.getEDTForFunction(F);
+    //   assert(MainEDT && "Main EDT not found");
+    //   auto &ARTSBuilder = ARTSInfoCache.ARTSBuilder;
 
-      LLVM_DEBUG(dbgs() << TAG << "----------- EDTs INFORMATION -----------\n");
-      LLVM_DEBUG(dbgs() << *MainEDT << "\n");
-      Function *MainEDTFunction = ARTSBuilder.createEDT("main.edt");
-      MainEDT->setF(MainEDTFunction);
-      /// Iterate through the EDT blocks
-      for(auto *EB : MainEDT->Blocks) {
-        /// Entry and Other blocks are inmmediately added to the main EDT Function
-        if(EB->isEntry() || EB->isOther()) {
-          ARTSBuilder.insertEDTBlock(EB, MainEDTFunction);
-          continue;
-        }
-        /// If it is an init block, we need to create a new EDT function for the 
-        /// outlined function
-        if(EB->isInit()) {
-          auto &OMP = EB->OMP;
-          assert(OMP.F && "OMP.F not found");
-          ARTSBuilder.insertEDTBlock(EB, MainEDTFunction);
-          Function *EDTFunction = ARTSBuilder.createEDT(OMP.F->getName());
-          /// Is there a init alloca EDT block?
-          if(!MainEDT->InitAlloca) {
-            // ARTSBuilder.insertEDTBlock(EB->InitAlloca, EDTFunction);
-          }
-          continue;
-        }
-      }
+    //   LLVM_DEBUG(dbgs() << TAG << "----------- EDTs INFORMATION -----------\n");
+    //   LLVM_DEBUG(dbgs() << *MainEDT << "\n");
+    //   Function *MainEDTFunction = ARTSBuilder.createEDT("main.edt");
+    //   MainEDT->setF(MainEDTFunction);
+    //   /// Iterate through the EDT blocks
+    //   for(auto *EB : MainEDT->Blocks) {
+    //     /// Entry and Other blocks are inmmediately added to the main EDT Function
+    //     if(EB->isEntry() || EB->isOther()) {
+    //       ARTSBuilder.insertEDTBlock(EB, MainEDTFunction);
+    //       continue;
+    //     }
+    //     /// If it is an init block, we need to create a new EDT function for the 
+    //     /// outlined function
+    //     if(EB->isInit()) {
+    //       auto &OMP = EB->OMP;
+    //       assert(OMP.F && "OMP.F not found");
+    //       ARTSBuilder.insertEDTBlock(EB, MainEDTFunction);
+    //       Function *EDTFunction = ARTSBuilder.createEDT(OMP.F->getName());
+    //       /// Is there a init alloca EDT block?
+    //       if(!MainEDT->InitAlloca) {
+    //         // ARTSBuilder.insertEDTBlock(EB->InitAlloca, EDTFunction);
+    //       }
+    //       continue;
+    //     }
+    //   }
 
-    }
+    // }
     indicateOptimisticFixpoint();
     return ChangeStatus::CHANGED;
   }
