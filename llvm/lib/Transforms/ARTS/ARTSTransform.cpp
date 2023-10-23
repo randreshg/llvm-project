@@ -10,13 +10,18 @@
 #include "llvm/Frontend/ARTS/ARTSIRBuilder.h"
 
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/Attributor.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 
+#include <cstdint>
 #include <optional>
 using namespace llvm;
 
@@ -526,7 +531,7 @@ struct AAToARTSFunction : AAToARTS {
     /// Extract code from the region
     auto FunctionName = "edt." + FromBB->getName().str();
     CodeExtractor CE(Region, DT, /* AggregateArgs */ false, /* BFI */ nullptr,
-                   /* BPI */ nullptr, AC, /* AllowVarArgs */ true,
+                   /* BPI */ nullptr, AC, /* AllowVarArgs */ false,
                    /* AllowAlloca */ true, /* AllocaBlock */ nullptr,
                    /* Suffix */ FunctionName);
     /// Debug info
@@ -557,9 +562,13 @@ struct AAToARTSFunction : AAToARTS {
     return OutF;
   }
 
-  void analyzeOutlinedRegion(Function &F, SmallVector<Value *, 0> *ArgsToRemove = nullptr) {
-    if (ArgsToRemove) {
-      for (auto *Arg : *ArgsToRemove) {
+  Function *analyzeOutlinedRegion(CallBase *RTCall, uint32_t OutlinedFunctionPos,
+                                  uint32_t KeepArgsFrom = 0, uint32_t KeepCallArgsFrom = 0) {
+    Function *F = dyn_cast<Function>(RTCall->getArgOperand(OutlinedFunctionPos));
+    if (KeepArgsFrom > 0) {
+      /// Get private and shared variables
+      for (unsigned int ArgItr = 0; ArgItr < KeepArgsFrom; ArgItr++) {
+        Value *Arg = F->args().begin() + ArgItr;
         // LLVM_DEBUG(dbgs() << "Removing argument: " << *Arg << "\n");
         /// Check all uses of the argument
         for (auto &U : Arg->uses()) {
@@ -585,6 +594,68 @@ struct AAToARTSFunction : AAToARTS {
         }
       }
     }
+    /// Create function with new signature
+    SmallVector<Type *, 0> Params;
+    uint32_t NumArgs = F->arg_size();
+    for (unsigned int ArgItr = KeepArgsFrom; ArgItr < NumArgs; ArgItr++) {
+      Value *Arg = F->args().begin() + ArgItr;
+      Params.push_back(Arg->getType());
+    }
+    /// Move instructions from old function to new function
+    /// Create a new function with the modified signature
+    auto NewFName = F->getName().str() + ".edt";
+    FunctionType *NewFType = FunctionType::get(F->getReturnType(), 
+                                               Params, false);
+    Function *NewF = Function::Create(NewFType, F->getLinkage(), 
+                                      NewFName, F->getParent());
+    // NewF->copyAttributesFrom(F);
+    /// Keep same argument names
+    auto *OldArg = F->arg_begin() + KeepArgsFrom;
+    for (auto &NewArg : NewF->args()) {
+      NewArg.setName(OldArg->getName());
+      OldArg++;
+    }
+    /// Copy the basic block and instructions
+    NewF->splice(NewF->begin(), F);
+    /// Create call to NewF
+    SmallVector<Value *, 0> Args;
+    NumArgs = RTCall->data_operands_size();
+    LLVM_DEBUG(dbgs() << "NumArgs: " << NumArgs << "\n");
+    for (unsigned int ArgItr = KeepCallArgsFrom; ArgItr < NumArgs; ArgItr++) {
+      Value *Arg = RTCall->getArgOperand(ArgItr);
+      Args.push_back(Arg);
+
+      /// If value is an instruction, we need to clone it
+      // if (auto *I = dyn_cast<Instruction>(Arg)) {
+      //   // Instruction *NewI = I->clone();
+      //   // NewI->insertBefore(RTCall);
+      //   // Args.push_back(NewI);
+      //   LLVM_DEBUG(dbgs() << "Argument: " << *I << "\n");
+      //   /// Add instruction as argument
+      //   Args.push_back(I);
+      // }
+      // else {
+      //   LLVM_DEBUG(dbgs() << "Not an Inst: " << *Arg << "\n");
+      //   /// Create a new pointer and add it to the list of arguments
+      //   // auto *NewArg = new AllocaInst(Arg->getType(), 0, "", RTCall);
+      //   Args.push_back(Arg);
+      // }
+        
+    }
+    CallInst *NewCall =  CallInst::Create(NewF, Args);
+    if (!RTCall->use_empty())
+      RTCall->replaceAllUsesWith(NewCall);
+    ReplaceInstWithInst(RTCall, NewCall);
+    // CB
+
+    // CallInst *NewCall = Builder.CreateCall(NewF, Args);
+    // NewCall->setCallingConv(NewF->getCallingConv());
+    /// Remove RTCall and F
+    // RTCall->eraseFromParent();
+    /// Remove attributes and debug info from F
+    // F->removeFnAttr(Attribute::NoInline);
+    // F->eraseFromParent();
+    return NewF;
   }
 
   bool identifyEDTs(Function &F, Attributor &A) {
@@ -675,14 +746,19 @@ struct AAToARTSFunction : AAToARTS {
           ParallelRegion++;
 
           /// Analyze outlined region
-          Function &OutlinedFunction = *dyn_cast<Function>(CB->getArgOperand(2));
-          SmallVector<Value *, 0> ArgsToRemove = {
-            OutlinedFunction.getArg(0), 
-            OutlinedFunction.getArg(1)};
-          analyzeOutlinedRegion(OutlinedFunction, &ArgsToRemove);
-          identifyEDTs(OutlinedFunction, A);
-          LLVM_DEBUG(dbgs() << "Outlined function: " << OutlinedFunction<< "\n");
-          createFunction(DT, &OutlinedFunction.getEntryBlock(), true);
+          const uint32_t ParallelOutlinedFunctionPos = 2;
+          const uint32_t KeepArgsFrom = 2;
+          const uint32_t KeepCallArgsFrom = 3;
+          Function *OutlinedFunction = analyzeOutlinedRegion(
+            CB, ParallelOutlinedFunctionPos,
+            KeepArgsFrom, KeepCallArgsFrom);
+          // LLVM_DEBUG(dbgs() << "CB " << *CB << "\n");
+          LLVM_DEBUG(dbgs() << "Main function: " << F<< "\n");
+          return false;
+          //
+          // identifyEDTs(*OutlinedFunction, A);
+          // LLVM_DEBUG(dbgs() << "Outlined function: " << *OutlinedFunction<< "\n");
+          // createFunction(DT, &OutlinedFunction->getEntryBlock(), true);
 
           /// Extract regions and outline them into functions
           Function *ParallelFunction = createFunction(DT, ParallelBB);
@@ -1030,6 +1106,7 @@ PreservedAnalyses ARTSTransformPass::run(Module &M, ModuleAnalysisManager &AM) {
   AC.DefaultInitializeLiveInternals = false;
   AC.DeleteFns = false;
   AC.RewriteSignatures = false;
+  // AC.UseLiveness = false;
   Attributor A(Functions, InfoCache, AC);
 
   /// Run ARTSTransform
