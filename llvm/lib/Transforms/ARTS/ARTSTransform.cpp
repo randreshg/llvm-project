@@ -2,6 +2,7 @@
 #include "llvm/Transforms/ARTS/ARTSTransform.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/CallGraphSCCPass.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
@@ -9,6 +10,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Frontend/ARTS/ARTSIRBuilder.h"
 
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
@@ -19,6 +21,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/Attributor.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/CallGraphUpdater.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 
 #include <cstdint>
@@ -52,16 +56,22 @@ static cl::opt<bool> PrintModuleAfterOptimizations(
 /// information that the attributor can use
 struct ARTSInformationCache : public InformationCache {
   ARTSInformationCache(Module &M, AnalysisGetter &AG,
+                       CallGraphUpdater &CGUpdater, 
                        BumpPtrAllocator &Allocator,
                        SetVector<Function *> *Functions)
-      : InformationCache(M, AG, Allocator, Functions), AG(AG), ARTSBuilder(M),
-        ARTSTransform(M) {
+      : InformationCache(M, AG, Allocator, Functions), AG(AG), 
+        CGUpdater(CGUpdater), Functions(*Functions),
+        ARTSBuilder(M), ARTSTransform(M) {
 
     ARTSBuilder.initialize();
   }
 
   /// Getters for analysis.
   AnalysisGetter &AG;
+  /// Call Graph
+  CallGraphUpdater &CGUpdater; 
+  /// Module functions
+  SetVector<Function *> &Functions;
   /// The ARTSIRBuilder instance.
   ARTSIRBuilder ARTSBuilder;
   /// ARTSTransformer pointer
@@ -564,11 +574,11 @@ struct AAToARTSFunction : AAToARTS {
 
   Function *analyzeOutlinedRegion(CallBase *RTCall, uint32_t OutlinedFunctionPos,
                                   uint32_t KeepArgsFrom = 0, uint32_t KeepCallArgsFrom = 0) {
-    Function *F = dyn_cast<Function>(RTCall->getArgOperand(OutlinedFunctionPos));
+    Function *OutlinedF = dyn_cast<Function>(RTCall->getArgOperand(OutlinedFunctionPos));
     if (KeepArgsFrom > 0) {
       /// Get private and shared variables
       for (unsigned int ArgItr = 0; ArgItr < KeepArgsFrom; ArgItr++) {
-        Value *Arg = F->args().begin() + ArgItr;
+        Value *Arg =OutlinedF->args().begin() + ArgItr;
         // LLVM_DEBUG(dbgs() << "Removing argument: " << *Arg << "\n");
         /// Check all uses of the argument
         for (auto &U : Arg->uses()) {
@@ -594,68 +604,221 @@ struct AAToARTSFunction : AAToARTS {
         }
       }
     }
-    /// Create function with new signature
-    SmallVector<Type *, 0> Params;
-    uint32_t NumArgs = F->arg_size();
-    for (unsigned int ArgItr = KeepArgsFrom; ArgItr < NumArgs; ArgItr++) {
-      Value *Arg = F->args().begin() + ArgItr;
-      Params.push_back(Arg->getType());
-    }
-    /// Move instructions from old function to new function
-    /// Create a new function with the modified signature
-    auto NewFName = F->getName().str() + ".edt";
-    FunctionType *NewFType = FunctionType::get(F->getReturnType(), 
-                                               Params, false);
-    Function *NewF = Function::Create(NewFType, F->getLinkage(), 
-                                      NewFName, F->getParent());
-    // NewF->copyAttributesFrom(F);
-    /// Keep same argument names
-    auto *OldArg = F->arg_begin() + KeepArgsFrom;
-    for (auto &NewArg : NewF->args()) {
-      NewArg.setName(OldArg->getName());
-      OldArg++;
-    }
-    /// Copy the basic block and instructions
-    NewF->splice(NewF->begin(), F);
-    /// Create call to NewF
-    SmallVector<Value *, 0> Args;
-    NumArgs = RTCall->data_operands_size();
-    LLVM_DEBUG(dbgs() << "NumArgs: " << NumArgs << "\n");
-    for (unsigned int ArgItr = KeepCallArgsFrom; ArgItr < NumArgs; ArgItr++) {
-      Value *Arg = RTCall->getArgOperand(ArgItr);
-      Args.push_back(Arg);
 
-      /// If value is an instruction, we need to clone it
-      // if (auto *I = dyn_cast<Instruction>(Arg)) {
-      //   // Instruction *NewI = I->clone();
-      //   // NewI->insertBefore(RTCall);
-      //   // Args.push_back(NewI);
-      //   LLVM_DEBUG(dbgs() << "Argument: " << *I << "\n");
-      //   /// Add instruction as argument
-      //   Args.push_back(I);
-      // }
-      // else {
-      //   LLVM_DEBUG(dbgs() << "Not an Inst: " << *Arg << "\n");
-      //   /// Create a new pointer and add it to the list of arguments
-      //   // auto *NewArg = new AllocaInst(Arg->getType(), 0, "", RTCall);
-      //   Args.push_back(Arg);
-      // }
-        
-    }
-    CallInst *NewCall =  CallInst::Create(NewF, Args);
-    if (!RTCall->use_empty())
-      RTCall->replaceAllUsesWith(NewCall);
-    ReplaceInstWithInst(RTCall, NewCall);
-    // CB
+    /// Aux variables to update cache
+    CallGraphUpdater &CGUpdater = AIT->CGUpdater;
+    SetVector<Function *> &Functions = AIT->Functions;
+    auto *OldFn = OutlinedF;
 
-    // CallInst *NewCall = Builder.CreateCall(NewF, Args);
-    // NewCall->setCallingConv(NewF->getCallingConv());
-    /// Remove RTCall and F
+    SmallVector<Type *, 16> NewArgumentTypes;
+    SmallVector<AttributeSet, 16> NewArgumentAttributes;
+  
+    // Collect replacement argument types and copy over existing attributes.
+    AttributeList OldFnAttributeList = OldFn->getAttributes();
+    for (auto ArgItr = KeepArgsFrom; ArgItr < OldFn->arg_size(); ArgItr++) {
+      Value *Arg = OldFn->args().begin() + ArgItr;
+      NewArgumentTypes.push_back(Arg->getType());
+      NewArgumentAttributes.push_back(
+          OldFnAttributeList.getParamAttrs(ArgItr));
+    }
+
+    FunctionType *OldFnTy = OldFn->getFunctionType();
+    Type *RetTy = OldFnTy->getReturnType();
+
+    // Construct the new function type using the new arguments types.
+    FunctionType *NewFnTy =
+        FunctionType::get(RetTy, NewArgumentTypes, OldFnTy->isVarArg());
+    LLVM_DEBUG(dbgs() << "[ARTS] Function rewrite '" << OldFn->getName()
+                      << "' from " << *OldFn->getFunctionType() << " to "
+                      << *NewFnTy << "\n");
+
+    // Create the new function body and insert it into the module.
+    Function *NewFn = Function::Create(NewFnTy, OldFn->getLinkage(),
+                                       OldFn->getAddressSpace(), "");
+    Functions.insert(NewFn);
+    OldFn->getParent()->getFunctionList().insert(OldFn->getIterator(), NewFn);
+    NewFn->takeName(OldFn);
+    NewFn->copyAttributesFrom(OldFn);
+
+    OldFn->setSubprogram(nullptr);
+
+    LLVMContext &Ctx = OldFn->getContext();
+    NewFn->setAttributes(AttributeList::get(
+        Ctx, OldFnAttributeList.getFnAttrs(), OldFnAttributeList.getRetAttrs(),
+        NewArgumentAttributes));
+    NewFn->setMemoryEffects(MemoryEffects::argMemOnly());
+
+    // Since we have now created the new function, splice the body of the old
+    // function right into the new function, leaving the old rotting hulk of the
+    // function empty.
+    NewFn->splice(NewFn->begin(), OldFn);
+    LLVM_DEBUG(dbgs() << "[ARTS] New function: \n" << *NewFn);
+
+    // Fixup block addresses to reference new function.
+    SmallVector<BlockAddress *, 8u> BlockAddresses;
+    for (User *U : OldFn->users()) {
+      if (auto *BA = dyn_cast<BlockAddress>(U))
+        BlockAddresses.push_back(BA);
+    }
+    for (auto *BA : BlockAddresses)
+      BA->replaceAllUsesWith(BlockAddress::get(NewFn, BA->getBasicBlock()));
+
+    /// Replace callsite
+    CallBase *OldCB = dyn_cast<CallBase>(RTCall);
+    const AttributeList &OldCallAttributeList = OldCB->getAttributes();
+
+    // Collect the new argument operands for the replacement call site.
+    SmallVector<Value *, 0> NewCallArgs;
+    SmallVector<Value *, 16> NewArgOperands;
+    SmallVector<AttributeSet, 16> NewArgOperandAttributes;
+    for (unsigned OldArgNum = KeepCallArgsFrom; OldArgNum < OldCB->data_operands_size(); ++OldArgNum) {
+      NewArgOperands.push_back(OldCB->getArgOperand(OldArgNum));
+      NewArgOperandAttributes.push_back(
+          OldCallAttributeList.getParamAttrs(OldArgNum));
+    }
+
+    /// Create new call
+    SmallVector<OperandBundleDef, 4> OperandBundleDefs;
+    OldCB->getOperandBundlesAsDefs(OperandBundleDefs);
+
+    // Create a new call or invoke instruction to replace the old one.
+    CallBase *NewCB;
+    auto *NewCI = CallInst::Create(NewFn, NewArgOperands, OperandBundleDefs,
+                                    "", OldCB);
+    NewCI->setTailCallKind(cast<CallInst>(OldCB)->getTailCallKind());
+    NewCB = NewCI;
+
+    // Copy over various properties and the new attributes.
+    // NewCB->copyMetadata(*OldCB, {LLVMContext::MD_prof, LLVMContext::MD_dbg});
+    NewCB->setCallingConv(OldCB->getCallingConv());
+    NewCB->takeName(OldCB);
+    NewCB->setAttributes(AttributeList::get(
+        Ctx, OldCallAttributeList.getFnAttrs(),
+        OldCallAttributeList.getRetAttrs(), NewArgOperandAttributes));
+    LLVM_DEBUG(dbgs() << "[ARTS] New call: " << *NewCB << "\n");
+
+    // Rewire the function arguments.
+    Argument *OldFnArgIt = OldFn->arg_begin() + KeepArgsFrom;
+    Argument *NewFnArgIt = NewFn->arg_begin();
+    for (unsigned OldArgNum = KeepArgsFrom; OldArgNum < OldFn->arg_size();
+         ++OldArgNum, ++OldFnArgIt) {
+      LLVM_DEBUG (dbgs() << "[ARTS] Rewiring argument: " << *OldFnArgIt 
+                         << " to " <<  << "\n");
+      NewFnArgIt->takeName(&*OldFnArgIt);
+      OldFnArgIt->replaceAllUsesWith(&*NewFnArgIt);
+      ++NewFnArgIt;
+    }
+    LLVM_DEBUG(dbgs() << "[ARTS] Rewired arguments\n");
+
+    // Eliminate the instructions *after* we visited all of them.
+    CGUpdater.replaceCallSite(*OldCB, *NewCB);
+    OldCB->replaceAllUsesWith(NewCB);
+    OldCB->eraseFromParent();
+
+    // Replace the function in the call graph (if any).
+    CGUpdater.replaceFunctionWith(*OldFn, *NewFn);
+
+    // /// Create function with new signature
+    // SmallVector<Type *, 0> NewFParams;
+    // uint32_t NumArgs = OldFn.arg_size();
+    // for (auto ArgItr = KeepArgsFrom; ArgItr < NumArgs; ArgItr++) {
+    //   Value *Arg = OldFn.args().begin() + ArgItr;
+    //   NewFParams.push_back(Arg->getType());
+    // }
+    // /// Create a new function with the modified signature
+    // auto NewFName = OldFn.getName().str() + ".edt";
+    // FunctionType *NewFType = FunctionType::get(
+    //   OldFn.getReturnType(), NewFParams, false);
+    // Function *NewF = Function::Create(NewFType, OldFn.getLinkage(), 
+    //                                   NewFName, OldFn.getParent());
+    // /// Keep same argument names for function signature
+    // auto ArgItr = KeepArgsFrom;
+    // for (auto &NewArg : NewF->args()) {
+    //   AttrBuilder AB(Ctx, OldFnAttributeList.getParamAttrs(ArgItr));
+    //   auto *OldArg = OldFn.arg_begin() + ArgItr;
+    //   NewArg.setName(OldArg->getName());
+    //   NewArg.addAttrs(AB);
+    //   ArgItr++;
+    // }
+    // /// Move the basic blocks and instructions
+    // // NewF->splice(NewF->begin(), &OldFn);
+    // /// Copy instructions from OldFn to NewF
+    // // for (auto &BB : OldFn) {
+    // //   BasicBlock *NewBB = BasicBlock::Create(Ctx, BB.getName(), NewF);
+    // //   for (auto &I : BB) {
+    // //     auto NewInst I.clone()->removeFromParent();
+
+    // //   }
+    // // }
+  
+    // // Clone the instructions from the original function to the new function
+    // ValueToValueMapTy VMap;
+    // for (auto &BB : OldFn) {
+    //     BasicBlock *NewBB = CloneBasicBlock(&BB, VMap, "", NewF);
+    //     VMap[&BB] = NewBB;
+    // }
+
+    // // Remap values in the new function
+    // // RemapInstruction(&NewF, VMap, RF_None, nullptr);
+    // LLVM_DEBUG(dbgs() << TAG << "Outlined function: " << *NewF << "\n");
+    // /// Generate list of arguments for call to new function
+    // SmallVector<Value *, 0> NewCallArgs;
+    // NumArgs = RTCall->data_operands_size();
+    // for (ArgItr = KeepCallArgsFrom; ArgItr < NumArgs; ArgItr++) {
+    //   Value *Arg = RTCall->getArgOperand(ArgItr);
+    //   NewCallArgs.push_back(Arg);
+    // }
+    // /// Create call to new function
+    // CallInst *NewCall =  CallInst::Create(NewF, NewCallArgs);
+    // /// Iterate through Callbase arguments and copy attributes
+    // CallBase *OldCB = dyn_cast<CallBase>(RTCall);
+    // CallBase *NewCB = dyn_cast<CallBase>(NewCall);
+    // AttributeList OldCBAttrs = OldCB->getAttributes();
+    // for (ArgItr = 0; ArgItr < NewCallArgs.size(); ArgItr++) {
+    //   auto OldAttrsSet = OldCBAttrs.getParamAttrs(ArgItr + KeepCallArgsFrom);
+    //   for(auto &Attr : OldAttrsSet)
+    //     NewCB->addParamAttr(ArgItr, Attr);
+    // }
+
+    // CGUpdater->removeCallSite(*OldCB);
+    // CGUpdater->removeFunction(OldFn);
+    // CGUpdater->replaceCallSite(*OldCB, *NewCB);
+    // // RTCall->replaceAllUsesWith(NewCall);
+    // OldCB->replaceAllUsesWith(NewCB);
+    // ReplaceInstWithInst(OldCB, NewCB);
+    // OldCB->eraseFromParent();
+    // // if (!RTCall->use_empty())
+    // CGUpdater->replaceFunctionWith(OldFn, *NewF);
+    //   RTCall->replaceAllUsesWith(NewCall);
+    // ReplaceInstWithInst(RTCall, NewCall);
+    // LLVM_DEBUG(dbgs() << TAG << "RTCALL: " << *RTCall << "\n");
+    // LLVM_DEBUG(dbgs() << TAG << "NEWCALL: " << *NewCall << "\n");
     // RTCall->eraseFromParent();
     /// Remove attributes and debug info from F
     // F->removeFnAttr(Attribute::NoInline);
     // F->eraseFromParent();
-    return NewF;
+    // ---------------
+    // Create a new call or invoke instruction to replace the old one.
+    // CallBase *NewCB;
+    // if (InvokeInst *II = dyn_cast<InvokeInst>(OldCB)) {
+    //   NewCB =
+    //       InvokeInst::Create(NewFn, II->getNormalDest(), II->getUnwindDest(),
+    //                           NewArgOperands, OperandBundleDefs, "", OldCB);
+    // } else {
+    //   auto *NewCI = CallInst::Create(NewFn, NewArgOperands, OperandBundleDefs,
+    //                                   "", OldCB);
+    //   NewCI->setTailCallKind(cast<CallInst>(OldCB)->getTailCallKind());
+    //   NewCB = NewCI;
+    // }
+
+    // // Copy over various properties and the new attributes.
+    // NewCB->copyMetadata(*OldCB, {LLVMContext::MD_prof, LLVMContext::MD_dbg});
+    // NewCB->setCallingConv(OldCB->getCallingConv());
+    // NewCB->takeName(OldCB);
+    // NewCB->setAttributes(AttributeList::get(
+    //     Ctx, OldCallAttributeList.getFnAttrs(),
+    //     OldCallAttributeList.getRetAttrs(), NewArgOperandAttributes));
+    return NewFn;
   }
 
   bool identifyEDTs(Function &F, Attributor &A) {
@@ -919,6 +1082,7 @@ struct AAToARTSFunction : AAToARTS {
     AIT = &static_cast<ARTSInformationCache &>(A.getInfoCache());
     AT = &AIT->ARTSTransform;
     AG = &AIT->AG;
+    
     /// Identify
     if (!identifyEDTs(*F, A)) {
       indicatePessimisticFixpoint();
@@ -1100,7 +1264,7 @@ PreservedAnalyses ARTSTransformPass::run(Module &M, ModuleAnalysisManager &AM) {
   AnalysisGetter AG(FAM);
   CallGraphUpdater CGUpdater;
   BumpPtrAllocator Allocator;
-  ARTSInformationCache InfoCache(M, AG, Allocator, &Functions);
+  ARTSInformationCache InfoCache(M, AG, CGUpdater, Allocator, &Functions);
   AttributorConfig AC(CGUpdater);
   AC.IsModulePass = true;
   AC.DefaultInitializeLiveInternals = false;
