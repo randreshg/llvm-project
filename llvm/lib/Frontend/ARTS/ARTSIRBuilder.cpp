@@ -204,7 +204,7 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc,
 
   /// Paramc are the number of static parameters.
   /// It corresponds to the number of first private variables.
-  int32_t NumParamC = DE.FirstprivateVars.size();
+  int32_t NumParamC = DE.FirstPrivates.size();
   AllocaInst *ParamC = Builder.CreateAlloca(Int32, nullptr, "paramc");
   Builder.CreateStore(ConstantInt::get(Int32, NumParamC), ParamC);
 
@@ -212,7 +212,7 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc,
   /// It corresponds to the private variables.
   AllocaInst *ParamVArray =
       Builder.CreateAlloca(Int64Ptr, nullptr, "paramv.array");
-  for (auto En : enumerate(DE.FirstprivateVars)) {
+  for (auto En : enumerate(DE.FirstPrivates)) {
     unsigned Index = En.index();
     Value *Val = En.value();
     /// Create the GEP to store the value in the ParamV array
@@ -233,7 +233,7 @@ Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc,
 
   /// Depc is the number of dependencies required for the EDT to run.
   /// It corresponds to the number of shared variables.
-  int32_t NumDepC = DE.SharedVars.size();
+  int32_t NumDepC = DE.Shareds.size();
   AllocaInst *DepC = Builder.CreateAlloca(Int32, nullptr, "depc");
   Builder.CreateStore(ConstantInt::get(Int32, NumDepC), DepC);
 

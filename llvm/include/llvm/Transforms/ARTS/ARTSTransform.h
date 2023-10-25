@@ -3,6 +3,8 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Transforms/IPO/Attributor.h"
@@ -13,46 +15,68 @@ namespace llvm {
 /// Struct to store information about the data environment of the OpenMP
 /// regions
 struct DataEnv {
+  enum DEType { OTHER = 0, PRIVATE, SHARED, FIRSTPRIVATE, LASTPRIVATE, NONE };
   /// Interface 
   DataEnv(){};
   DataEnv(DataEnv &DE) { append(DE); };
   DataEnv &operator=(const DataEnv &DE) {
-    PrivateVars = DE.PrivateVars;
-    SharedVars = DE.SharedVars;
-    FirstprivateVars = DE.FirstprivateVars;
-    LastprivateVars = DE.LastprivateVars;
+    Privates = DE.Privates;
+    Shareds = DE.Shareds;
+    FirstPrivates = DE.FirstPrivates;
+    LastPrivates = DE.LastPrivates;
     return *this;
   }
 
   void append(const DataEnv &DE) {
-    PrivateVars.append(DE.PrivateVars.begin(), DE.PrivateVars.end());
-    SharedVars.append(DE.SharedVars.begin(), DE.SharedVars.end());
-    FirstprivateVars.append(DE.FirstprivateVars.begin(),
-                            DE.FirstprivateVars.end());
-    LastprivateVars.append(DE.LastprivateVars.begin(),
-                           DE.LastprivateVars.end());
+    Privates.insert(DE.Privates.begin(), DE.Privates.end());
+    Shareds.insert(DE.Shareds.begin(), DE.Shareds.end());
+    FirstPrivates.insert(DE.FirstPrivates.begin(),
+                            DE.FirstPrivates.end());
+    LastPrivates.insert(DE.LastPrivates.begin(),
+                           DE.LastPrivates.end());
   };
 
+  /// Given a Value, it returns if it is in the Data Environment
+  bool isInDE(Value *V) {
+    if (Privates.count(V) || Shareds.count(V) ||
+        FirstPrivates.count(V) || LastPrivates.count(V))
+      return true;
+    return false;
+  }
+
+  /// Given a Value, it returns the DEType
+  DEType getDEType(Value *V) {
+    if (Privates.count(V))
+      return DEType::PRIVATE;
+    if (Shareds.count(V))
+      return DEType::SHARED;
+    if (FirstPrivates.count(V))
+      return DEType::FIRSTPRIVATE;
+    if (LastPrivates.count(V))
+      return DEType::LASTPRIVATE;
+    return DEType::NONE;
+  }
+
   /// Attributes 
-  SmallVector<Value *, 4> PrivateVars;
-  SmallVector<Value *, 4> SharedVars;
-  SmallVector<Value *, 4> FirstprivateVars;
-  SmallVector<Value *, 4> LastprivateVars;
+  SetVector<Value *> Privates;
+  SetVector<Value *> Shareds;
+  SetVector<Value *> FirstPrivates;
+  SetVector<Value *> LastPrivates;
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS, DataEnv &DE) {
   OS << "Data environment: \n";
-  OS << "Firstprivate: " << DE.FirstprivateVars.size() << "\n";
-  for (auto *V : DE.FirstprivateVars)
+  OS << "Firstprivate: " << DE.FirstPrivates.size() << "\n";
+  for (auto *V : DE.FirstPrivates)
     OS << "  - " << *V << "\n";
-  OS << "Private: " << DE.PrivateVars.size() << "\n";
-  for (auto *V : DE.PrivateVars)
+  OS << "Private: " << DE.Privates.size() << "\n";
+  for (auto *V : DE.Privates)
     OS << "  - " << *V << "\n";
-  OS << "Shared: " << DE.SharedVars.size() << "\n";
-  for (auto *V : DE.SharedVars)
+  OS << "Shared: " << DE.Shareds.size() << "\n";
+  for (auto *V : DE.Shareds)
     OS << "  - " << *V << "\n";
-  OS << "Lastprivate: " << DE.LastprivateVars.size() << "\n";
-  for (auto *V : DE.LastprivateVars)
+  OS << "Lastprivate: " << DE.LastPrivates.size() << "\n";
+  for (auto *V : DE.LastPrivates)
     OS << "  - " << *V << "\n";
   OS << "\n";
   return OS;
@@ -293,6 +317,7 @@ inline raw_ostream &operator<<(raw_ostream &OS, EDTInfo &EI) {
   return OS;
 }
 
+
 /// ARTS TRANSFORM 
 struct ARTSTransformer {
   /// Interface 
@@ -303,10 +328,13 @@ struct ARTSTransformer {
     //   delete (It.second);
     // EDTBlocks.clear();
   }
-  bool run(Attributor &A);
+  bool run(FunctionAnalysisManager &FAM);
   bool runAttributor(Attributor &A);
 
   /// Helper Functions 
+  /// Insert CB to analyze
+  void insertCB(CallBase *CB) { CBs.insert(CB); }
+  
   /// Insert EDT
   EDTInfo *insertEDT(Function *F, EDTBlock *Init = nullptr) {
     EDTInfo *EDTI = new EDTInfo(EDTID++);
@@ -383,6 +411,8 @@ struct ARTSTransformer {
   /// Attributes 
   /// The underlying module.
   Module &M;
+  /// Set of CB to analyze
+  SmallPtrSet<CallBase *, 4> CBs;
   /// Set of valid functions in the module.
   // SetVector<Function *> &Functions;
   /// List of EDTs

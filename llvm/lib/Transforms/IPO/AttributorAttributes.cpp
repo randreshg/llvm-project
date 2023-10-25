@@ -1114,9 +1114,9 @@ struct AAPointerInfoImpl
                        const AAPointerInfo *)> CB)
     const override {
     for (auto &It : OffsetBins) {
-      const AA::RangeTy& key = It.first;
-      const SmallSet<unsigned, 4>& value = It.second;
-      if (!CB(key, value, this))
+      const AA::RangeTy& Key = It.first;
+      const SmallSet<unsigned, 4>& Value = It.second;
+      if (!CB(Key, Value, this))
         return false;
     }
     return true;
