@@ -904,7 +904,6 @@ struct ARTSAnalyzer {
     // The function returns ChangeStatus::CHANGED if the data environment is
     // updated, ChangeStatus::UNCHANGED otherwise.
 
-
     OMPInfo OI(OMPInfo::TASK, CB);
     const uint32_t TaskOutlinedFunctionPos = 5;
     /// Maps a value to an offset in the task data
@@ -1040,7 +1039,7 @@ struct ARTSAnalyzer {
     LLVM_DEBUG(dbgs() << " - New CB: " << *NewCI << "\n");
   
     /// Remove Argument 0 and 1 from Original Task Outlined Function
-    LLVM_DEBUG(dbgs() << " - Removing arguments from Outlined function\n");
+    // LLVM_DEBUG(dbgs() << " - Removing arguments from Outlined function\n");
     replaceValueWithUndef(OutlinedFn->getArg(0), true);
     replaceValueWithUndef(OutlinedFn->getArg(1), true);
     ValuesToRemove.push_back(CB);
@@ -1054,8 +1053,6 @@ struct ARTSAnalyzer {
         Terminator->eraseFromParent();
       }
     }
-
-    // LLVM_DEBUG(dbgs() << " - New function: \n" << *NewFn);
 
     if(!identifyEDTs(*NewFn))
       return false;
