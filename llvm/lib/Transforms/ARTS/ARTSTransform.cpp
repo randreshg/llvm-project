@@ -1,5 +1,7 @@
 
 #include "llvm/Transforms/ARTS/ARTSTransform.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CallGraphSCCPass.h"
@@ -645,6 +647,96 @@ struct ARTSAnalyzer {
     }
   }
 
+  /// Remove values interface
+  void removeValue(Value *V) {
+    if (isa<UndefValue>(V))
+      return;
+    /// Instructions
+    if(auto *I = dyn_cast<Instruction>(V)) {
+        if (auto *CBI = dyn_cast<CallBase>(I)) {
+          LLVM_DEBUG(dbgs() << "   - Removing call instruction: " << *CBI << "\n");
+          /// Iterate through the arguments and replace them with undef using int itr
+          for (uint32_t ArgItr = 0; ArgItr < CBI->data_operands_size(); ArgItr++) {
+            Value *Arg = CBI->getArgOperand(ArgItr);
+            if (!isa<PointerType>(Arg->getType()))
+              continue;
+
+            LLVM_DEBUG(dbgs() << "    - Arg: " << *Arg << "\n");
+            // replaceValueWithUndef(Arg, false);
+            removeValue(Arg);
+          }
+        }
+      LLVM_DEBUG(dbgs() << "   - Removing instruction: " << *I << "\n");
+      replaceValueWithUndef(I, false);
+      I->eraseFromParent();
+      LLVM_DEBUG(dbgs() << "    - Instruction removed\n");
+      return;
+    }
+
+    replaceValueWithUndef(V, false);
+    /// Global variables are not instructions, but we still need to remove them
+    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(V)) {
+      LLVM_DEBUG(dbgs() << "   - Removing global variable: " << *GV << "\n");
+      GV->eraseFromParent();
+      return;
+    }
+
+    /// Function
+    if (Function *F = dyn_cast<Function>(V)) {
+      LLVM_DEBUG(dbgs() << "   - Removing function: " << *F << "\n");
+      F->eraseFromParent();
+      return;
+    }
+  }
+
+  void removeValues() {
+    LLVM_DEBUG(dbgs() << "\n" << TAG << "Removing values\n");
+    for (auto *V : ValuesToRemove) {
+      removeValue(V);
+    }
+  }
+  /// Function to iteratively replace uses of a Value with UndefValue
+  /// and remove instructions if requested.
+  void replaceValueWithUndef(Value *V, bool RemoveInsts = false) {
+    /// If the value is undef, we dont need to do anything
+    if (isa<UndefValue>(V)) {
+      // LLVM_DEBUG(dbgs() << "Value is undef\n");
+      return;
+    }
+    // Create a worklist to keep track of instructions to be removed
+    SmallVector<Instruction *, 16> Worklist;
+    // Initialize the worklist with all uses of the argument
+    for (auto &Use : V->uses()) {
+      if (Instruction *UserInst = dyn_cast<Instruction>(Use.getUser())) {
+        LLVM_DEBUG(dbgs() << "    - Use: " << *UserInst << "\n");
+        Worklist.push_back(UserInst);
+      }
+    }
+    V->replaceAllUsesWith(UndefValue::get(V->getType()));
+    // Replace uses with UndefValue and mark instructions for removal
+    while (!Worklist.empty()) {
+      Instruction *Inst = Worklist.pop_back_val();
+      // LLVM_DEBUG(dbgs() << ". Replacing: " << *Inst << "\n");
+      // Add users of this instruction to the worklist for further processing
+      for (auto &Use : Inst->uses()) {
+        if (Instruction *UserInst = dyn_cast<Instruction>(Use.getUser())) {
+          Worklist.push_back(UserInst);
+        }
+      }
+      // Replace uses of the argument with UndefValue
+      Value *Undef = UndefValue::get(Inst->getType());
+      Inst->replaceAllUsesWith(Undef);
+      // Mark the instruction for removal
+      if(RemoveInsts)
+        Inst->eraseFromParent();
+        // removeValue(Inst);
+    }
+
+    /// Remove the value itself
+    // if(RemoveInsts)
+    //   removeValue(V);
+  }
+
   /// Given a basic block, this function creates a function that contains
   /// the instructions of the BB. The function is then inserted to the
   /// module.
@@ -751,14 +843,16 @@ struct ARTSAnalyzer {
                                        OldFn->getAddressSpace(), "");
     OldFn->getParent()->getFunctionList().insert(OldFn->getIterator(), NewFn);
     NewFn->takeName(OldFn);
-    NewFn->copyAttributesFrom(OldFn);
+    NewFn->setName("parallel.edt");
+    // NewFn->copyAttributesFrom(OldFn);
     OldFn->setSubprogram(nullptr);
+    OldFn->setMetadata("dbg", nullptr);
 
     LLVMContext &Ctx = OldFn->getContext();
-    NewFn->setAttributes(AttributeList::get(
-        Ctx, OldFnAttributeList.getFnAttrs(), OldFnAttributeList.getRetAttrs(),
-        NewArgumentAttributes));
-    NewFn->setMemoryEffects(MemoryEffects::argMemOnly());
+    // NewFn->setAttributes(AttributeList::get(
+    //     Ctx, OldFnAttributeList.getFnAttrs(), OldFnAttributeList.getRetAttrs(),
+    //     NewArgumentAttributes));
+    // NewFn->setMemoryEffects(MemoryEffects::argMemOnly());
 
     // Since we have now created the new function, splice the body of the old
     // function right into the new function, leaving the old rotting hulk of the
@@ -790,25 +884,19 @@ struct ARTSAnalyzer {
           OldCallAttributeList.getParamAttrs(OldArgNum));
     }
 
-    /// Create new call
-    SmallVector<OperandBundleDef, 4> OperandBundleDefs;
-    OldCB->getOperandBundlesAsDefs(OperandBundleDefs);
-
     // Create a new call or invoke instruction to replace the old one.
-    CallBase *NewCB;
     auto *NewCI =
-        CallInst::Create(NewFn, NewArgOperands, OperandBundleDefs, "", OldCB);
+        CallInst::Create(NewFn, NewArgOperands, std::nullopt, "", OldCB);
     NewCI->setTailCallKind(cast<CallInst>(OldCB)->getTailCallKind());
-    NewCB = NewCI;
 
     // Copy over various properties and the new attributes.
-    // NewCB->copyMetadata(*OldCB, {LLVMContext::MD_prof, LLVMContext::MD_dbg});
+    CallBase *NewCB = NewCI;
     NewCB->setCallingConv(OldCB->getCallingConv());
     NewCB->takeName(OldCB);
     NewCB->setAttributes(AttributeList::get(
         Ctx, OldCallAttributeList.getFnAttrs(),
         OldCallAttributeList.getRetAttrs(), NewArgOperandAttributes));
-    LLVM_DEBUG(dbgs() << "- New call: " << *NewCB << "\n");
+    // LLVM_DEBUG(dbgs() << "- New call: " << *NewCB << "\n");
 
     // Rewire the function arguments.
     Argument *OldFnArgIt = OldFn->arg_begin() + KeepArgsFrom;
@@ -823,6 +911,7 @@ struct ARTSAnalyzer {
     // Eliminate the instructions *after* we visited all of them.
     OldCB->replaceAllUsesWith(NewCB);
     OldCB->eraseFromParent();
+    ValuesToRemove.push_back(OldFn);
 
     assert(NewFn->isDeclaration() == false && "New function is a declaration");
     return NewFn;
@@ -839,14 +928,12 @@ struct ARTSAnalyzer {
     if(!identifyEDTs(*OutlinedFunction))
       return false;
     return true;
-}
+  }
 
   bool handleTaskOutlinedRegion(CallBase *CB) {
     AT.insertCB(CB);
     /// Analyze outlined region
     const uint32_t TaskOutlinedFunctionPos = 5;
-    const uint32_t KeepArgsFrom = 2;
-    const uint32_t KeepCallArgsFrom = 3;
 
     /// Analyze return pointer
     // For the shared variables we are interested in all stores that are done
@@ -878,10 +965,10 @@ struct ARTSAnalyzer {
     // updated, ChangeStatus::UNCHANGED otherwise.
 
     OMPInfo OI(OMPInfo::TASK, CB);
-    /// Maps offsets to values in the task data
-    DenseMap<int64_t, Value *> OffsetToValueTD;
-    /// Maps a value to an offset in the Outlined Function
-    DenseMap<Value *, int64_t> ValueToOffsetOF;
+    /// Maps a value to an offset in the task data
+    DenseMap<Value *, int64_t> ValueToOffsetTD;
+    /// Maps an offset to a value in the Outlined Function
+    DenseMap<int64_t, Value *> OffsetToValueOF;
   
     /// Get context and module
     const DataLayout &DL = CB->getModule()->getDataLayout();
@@ -895,7 +982,7 @@ struct ARTSAnalyzer {
     /// Analyze Task Data
     /// This analysis assumes we only have stores to the task struct
     BasicBlock *BB = CB->getParent();
-    LLVM_DEBUG(dbgs() << "TASKDATA ANALYSIS\n");
+    // LLVM_DEBUG(dbgs() << "TASKDATA ANALYSIS\n");
     for (Instruction &I : *BB) {
       if (&I == CB)
         continue;
@@ -907,21 +994,13 @@ struct ARTSAnalyzer {
       auto *S = cast<StoreInst>(&I);
       GetPointerBaseWithConstantOffset(S->getPointerOperand(), Offset, DL);
       auto *Val = S->getValueOperand();
-      // if(auto *VI = dyn_cast<Instruction>(Val)) {
-      //   /// If it is a load or a store, get the pointer operand
-      //   if(auto *L = dyn_cast<LoadInst>(VI)) {
-      //     Val = L->getPointerOperand();
-      //   } else if(auto *S = dyn_cast<StoreInst>(VI)) {
-      //     Val = S->getPointerOperand();
-      //   }
-      // }
-      OffsetToValueTD[Offset] = Val;
-      
-      LLVM_DEBUG({
-        dbgs() << "  - Store: " << *S << "\n";
-        dbgs() << "    - ValOperand: " << *(S->getValueOperand()) << "\n";
-        dbgs() << "    - Offset: " << Offset << "\n";
-      });
+      ValueToOffsetTD[Val] = Offset;
+
+      // LLVM_DEBUG({
+      //   dbgs() << "  - Store: " << *S << "\n";
+      //   dbgs() << "    - ValOperand: " << *(S->getValueOperand()) << "\n";
+      //   dbgs() << "    - Offset: " << Offset << "\n";
+      // });
 
       /// Private variables
       if(Offset > TaskDataSize) {
@@ -935,7 +1014,7 @@ struct ARTSAnalyzer {
     /// Analyze Outlined Function
     Function *OutlinedFn =
       dyn_cast<Function>(CB->getArgOperand(TaskOutlinedFunctionPos));
-    auto *TaskData = dyn_cast<Argument>(OutlinedFn->arg_begin() + 1);
+    Argument *TaskData = dyn_cast<Argument>(OutlinedFn->arg_begin() + 1);
     /// This assumes the 'desaggregation' happens in the first basic block
     BasicBlock *EntryBB = &OutlinedFn->getEntryBlock();
     BasicBlock::iterator Itr = EntryBB->begin();
@@ -970,33 +1049,31 @@ struct ARTSAnalyzer {
       //   dbgs() << "    - BasePointer: " << *BasePointer << "\n";
       //   dbgs() << "    - Offset: " << Offset << "\n";
       // });
-      ValueToOffsetOF[L] = Offset;
-      if(ValueToOffsetOF.size() == OffsetToValueTD.size())
+      OffsetToValueOF[Offset] = L;
+      if(OffsetToValueOF.size() == ValueToOffsetTD.size())
         break;
     }
 
     /// Assert size of value to offset map
-    assert(OffsetToValueTD.size() == ValueToOffsetOF.size() &&
+    assert(ValueToOffsetTD.size() == OffsetToValueOF.size() &&
             "ValueToOffsetTD and ValueToOffsetOF have different sizes");
 
     /// Debug ValueToOffsetOF and OffsetToValueTD
-    LLVM_DEBUG({
-      dbgs() << "ValueToOffsetOF\n";
-      for(auto Itr : ValueToOffsetOF) {
-        dbgs() << "  - " << Itr.second << " - " << *(Itr.first) << " - Ty: " << *(Itr.first->getType()) << "\n";
-      }
-      dbgs() << "OffsetToValueTD\n";
-      for(auto Itr : OffsetToValueTD) {
-        dbgs() << "  - " << Itr.first << " - " << *(Itr.second) << " - Ty: " << *(Itr.second->getType()) << "\n";
-      }
-      dbgs() << "\n" << *OutlinedFn << "\n";
-    });
-    LLVM_DEBUG(dbgs() << "  - Outlined Function: " << *OutlinedFn << "\n");
+    // LLVM_DEBUG({
+    //   dbgs() << "ValueToOffsetOF\n";
+    //   for(auto Itr : OffsetToValueOF) {
+    //     dbgs() << "  - " << Itr.first << " - " << *(Itr.second) << " - Ty: " << *(Itr.second->getType()) << "\n";
+    //   }
+    //   dbgs() << "OffsetToValueTD\n";
+    //   for(auto Itr : ValueToOffsetTD) {
+    //     dbgs() << "  - " << Itr.second << " - " << *(Itr.first) << " - Ty: " << *(Itr.first->getType()) << "\n";
+    //   }
+    // });
 
-    /// Generate new function signature using ValuesToOffsetCB
+    /// Generate new function signature using OffsetToValueTD
     SmallVector<Type *, 16> NewArgumentTypes;
-    for(auto Itr : OffsetToValueTD) {
-      auto *V = Itr.second;
+    for(auto Itr : ValueToOffsetTD) {
+      auto *V = Itr.first;
       NewArgumentTypes.push_back(V->getType());
     }
     FunctionType *NewFnTy =
@@ -1010,28 +1087,53 @@ struct ARTSAnalyzer {
     OutlinedFn->getParent()->getFunctionList().insert(
       OutlinedFn->getIterator(), NewFn);
     NewFn->takeName(OutlinedFn);
+    NewFn->setName("task.edt");
     OutlinedFn->setSubprogram(nullptr);
+    OutlinedFn->setMetadata("dbg", nullptr);
 
     /// Move BB to new function
     NewFn->splice(NewFn->begin(), OutlinedFn);
-    /// Debug New function
-    LLVM_DEBUG(dbgs() << "[ARTS] New function: \n" << *NewFn);
     /// Rewire the function arguments.
-    
-    /// Replace uses with ValuesToOffsetOF
-    // for(auto Itr : ValueToOffsetOF) {
-    //   auto *V = Itr.first;
-    //   auto Offset = Itr.second;
-    //   auto *Val = OffsetToValueTD[Offset];
-    //   V->takeName(Val);
-    //   V->replaceAllUsesWith(V);
-    // }
+    Argument *NewFnArgItr = NewFn->arg_begin();
+    for (auto TDItr : ValueToOffsetTD) {
+      Value *V = OffsetToValueOF[TDItr.second];
+      // LLVM_DEBUG(dbgs() << " - Rewiring argument: " << *V << " to " << *NewFnArgItr << "\n");
+      V->replaceAllUsesWith(NewFnArgItr);
+      ++NewFnArgItr;
+    }
 
+    /// Generate CallInst to NewFn
+    SmallVector<Value *, 0> NewCallArgs;
+    for (auto TDItr : ValueToOffsetTD) {
+      NewCallArgs.push_back(TDItr.first);
+    }
 
+    auto *LastInstruction = BB->getTerminator();
+    auto *NewCI =
+        CallInst::Create(NewFn, NewCallArgs, std::nullopt, "", LastInstruction);
+    NewCI->setTailCallKind(cast<CallInst>(CB)->getTailCallKind());
 
-    // -----------------
+    /// Remove Argument 0 and 1 from Original Task Outlined Function
+    replaceValueWithUndef(OutlinedFn->getArg(0), true);
+    replaceValueWithUndef(OutlinedFn->getArg(1), true);
 
-    // if(!identifyEDTs(*OutlinedFn))
+    /// Remove Values
+    ValuesToRemove.push_back(CB);
+    // ValuesToRemove.push_back(OutlinedFn);
+
+    // Iterate through the basic blocks and check/replace terminators
+    for (auto &NewBB : *NewFn) {
+      auto *Terminator = NewBB.getTerminator();
+      if (isa<ReturnInst>(Terminator)) {
+        IRBuilder<> Builder(Terminator);
+        Builder.CreateRetVoid();
+        Terminator->eraseFromParent();
+      }
+    }
+
+    // LLVM_DEBUG(dbgs() << " - New function: \n" << *NewFn);
+
+    // if(!identifyEDTs(*NewFn))
       return false;
     return true;
   }
@@ -1110,8 +1212,6 @@ struct ARTSAnalyzer {
         case OMPInfo::PARALLEL: {
           LLVM_DEBUG(dbgs() << TAG << "Parallel Region Found: " << "\n  "
                             <<  *CB << "\n");
-          // 
-
           /// Split block at __kmpc_parallel
           auto ParallelName = "par.region." + std::to_string(ParallelRegion);
           BasicBlock *ParallelBB =
@@ -1132,6 +1232,7 @@ struct ARTSAnalyzer {
           // Function *ParallelFunction = createFunction(DT, ParallelBB);
           /// For the Done function run the analysis again
           Function *DoneFunction = createFunction(DT, ParallelDone, true);
+          DoneFunction->setName("parallel.edt.done");
           /// Get caller of the Done function, and rename BB to par.done
           CallBase *DoneCB = dyn_cast<CallBase>(DoneFunction->user_back());
           BasicBlock *DoneBB = DoneCB->getParent();
@@ -1171,6 +1272,7 @@ struct ARTSAnalyzer {
           /// Extract regions and create aux functions
           /// For the Done function run the analysis again
           Function *DoneFunction = createFunction(DT, TaskDone, true);
+          DoneFunction->setName("task.edt.done");
           identifyEDTs(*DoneFunction);
           CallBase *DoneCB = dyn_cast<CallBase>(DoneFunction->user_back());
           BasicBlock *DoneBB = DoneCB->getParent();
@@ -1217,6 +1319,8 @@ struct ARTSAnalyzer {
   ARTSTransformer &AT;
   FunctionAnalysisManager &FAM;
   AnalysisGetter &AG;
+  /// Set of Values to remove
+  SmallVector<Value *, 16> ValuesToRemove;
 };
 
 
@@ -1268,9 +1372,10 @@ bool ARTSTransformer::run(FunctionAnalysisManager &FAM) {
   AnalysisGetter AG(FAM);
   ARTSAnalyzer Analyzer(*this, FAM, AG);
   Analyzer.identifyEDTs(*MainF);
+  Analyzer.removeValues();
 
-  // LLVM_DEBUG(dbgs() << TAG << "Module after ARTSAnalyzer:\n"
-  //                     << M);
+  LLVM_DEBUG(dbgs() << TAG << "Module after ARTSAnalyzer:\n"
+                      << M);
 
   /// Get the set of functions in the module
   SetVector<Function *> Functions;
