@@ -140,25 +140,25 @@ AllocaInst *ARTSIRBuilder::reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node) {
   return GuidAddr;
 }
 
-void ARTSIRBuilder::insertEDTBlock(EDTBlock *EB, Function *EDTFunc) {
-  LLVM_DEBUG(dbgs() << TAG << "Inserting EDT Block\n");
-  auto *BB = EB->BB;
-  /// Detach BB from its parent
-  BB->removeFromParent();
-  /// Attach BB to the EDT Func
-  if(EB->isEntry()) {
-    /// Remove entry block
-    BasicBlock *EntryBB = &EDTFunc->getEntryBlock();
-    EntryBB->removeFromParent();
-  }
-  BB->insertInto(EDTFunc);
-  /// Redirect last BB to BB
-  BasicBlock *LastBB = &EDTFunc->back();
-  if(LastBB != BB)
-    redirectTo(LastBB, BB);
-}
+// void ARTSIRBuilder::insertEDTBlock(EDTBlock *EB, Function *EDTFunc) {
+//   LLVM_DEBUG(dbgs() << TAG << "Inserting EDT Block\n");
+//   auto *BB = EB->BB;
+//   /// Detach BB from its parent
+//   BB->removeFromParent();
+//   /// Attach BB to the EDT Func
+//   if(EB->isEntry()) {
+//     /// Remove entry block
+//     BasicBlock *EntryBB = &EDTFunc->getEntryBlock();
+//     EntryBB->removeFromParent();
+//   }
+//   BB->insertInto(EDTFunc);
+//   /// Redirect last BB to BB
+//   BasicBlock *LastBB = &EDTFunc->back();
+//   if(LastBB != BB)
+//     redirectTo(LastBB, BB);
+// }
 
-Function *ARTSIRBuilder::createEDT(StringRef Name) {
+Function *ARTSIRBuilder::createEdt(StringRef Name) {
   const std::string FuncName = (Name + ".edt").str();
   LLVM_DEBUG(dbgs() << TAG << "Creating EDT: " << FuncName << "\n");
   Function *Func =
@@ -170,7 +170,7 @@ Function *ARTSIRBuilder::createEDT(StringRef Name) {
   return Func;
 }
 
-Function *ARTSIRBuilder::initializeEDT(EDTInfo &EI, Function *EDTFunc,
+Function *ARTSIRBuilder::initializeEDT(EdtInfo &EI, Function *EDTFunc,
                                        BasicBlock *CurBB) {
   auto &DE = EI.DE;
   /// Get CurBB parent

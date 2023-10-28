@@ -5,85 +5,17 @@
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/PassManager.h"
+// #include "llvm/IR/Type.h"
 #include "llvm/Transforms/IPO/Attributor.h"
+#include <cstdint>
 
 namespace llvm {
 
-/// DATA ENVIRONMENT
-/// Struct to store information about the data environment of the OpenMP
-/// regions
-struct DataEnv {
-  enum DEType { OTHER = 0, PRIVATE, SHARED, FIRSTPRIVATE, LASTPRIVATE, NONE };
-  /// Interface 
-  DataEnv(){};
-  DataEnv(DataEnv &DE) { append(DE); };
-  DataEnv &operator=(const DataEnv &DE) {
-    Privates = DE.Privates;
-    Shareds = DE.Shareds;
-    FirstPrivates = DE.FirstPrivates;
-    LastPrivates = DE.LastPrivates;
-    return *this;
-  }
-
-  void append(const DataEnv &DE) {
-    Privates.insert(DE.Privates.begin(), DE.Privates.end());
-    Shareds.insert(DE.Shareds.begin(), DE.Shareds.end());
-    FirstPrivates.insert(DE.FirstPrivates.begin(),
-                            DE.FirstPrivates.end());
-    LastPrivates.insert(DE.LastPrivates.begin(),
-                           DE.LastPrivates.end());
-  };
-
-  /// Given a Value, it returns if it is in the Data Environment
-  bool isInDE(Value *V) {
-    if (Privates.count(V) || Shareds.count(V) ||
-        FirstPrivates.count(V) || LastPrivates.count(V))
-      return true;
-    return false;
-  }
-
-  /// Given a Value, it returns the DEType
-  DEType getDEType(Value *V) {
-    if (Privates.count(V))
-      return DEType::PRIVATE;
-    if (Shareds.count(V))
-      return DEType::SHARED;
-    if (FirstPrivates.count(V))
-      return DEType::FIRSTPRIVATE;
-    if (LastPrivates.count(V))
-      return DEType::LASTPRIVATE;
-    return DEType::NONE;
-  }
-
-  /// Attributes 
-  SetVector<Value *> Privates;
-  SetVector<Value *> Shareds;
-  SetVector<Value *> FirstPrivates;
-  SetVector<Value *> LastPrivates;
-};
-
-inline raw_ostream &operator<<(raw_ostream &OS, DataEnv &DE) {
-  OS << "Data environment: \n";
-  OS << "Firstprivate: " << DE.FirstPrivates.size() << "\n";
-  for (auto *V : DE.FirstPrivates)
-    OS << "  - " << *V << "\n";
-  OS << "Private: " << DE.Privates.size() << "\n";
-  for (auto *V : DE.Privates)
-    OS << "  - " << *V << "\n";
-  OS << "Shared: " << DE.Shareds.size() << "\n";
-  for (auto *V : DE.Shareds)
-    OS << "  - " << *V << "\n";
-  OS << "Lastprivate: " << DE.LastPrivates.size() << "\n";
-  for (auto *V : DE.LastPrivates)
-    OS << "  - " << *V << "\n";
-  OS << "\n";
-  return OS;
-}
-
 /// OMP INFO 
-/// Struct to store information about OpenMP regions
+/// Helper Struct to get OpenMP related information
 struct OMPInfo {
   enum RTFType {
     OTHER = 0,
@@ -95,23 +27,6 @@ struct OMPInfo {
     TASKDEP,
     SET_NUM_THREADS
   };
-
-  /// Interface 
-  OMPInfo() : RTF(OTHER), CB(nullptr), F(nullptr){};
-  OMPInfo(OMPInfo &OI) : RTF(OI.RTF), DE(OI.DE), CB(OI.CB), F(OI.F){};
-  OMPInfo(RTFType RTF, CallBase *CB) : RTF(RTF), CB(CB), F(nullptr){};
-  OMPInfo &operator=(const OMPInfo &OI) {
-    RTF = OI.RTF;
-    DE = OI.DE;
-    CB = OI.CB;
-    F = OI.F;
-    return *this;
-  }
-  /// Attributes 
-  RTFType RTF;
-  DataEnv DE;
-  CallBase *CB; // CallBase of the OpenMP region
-  Function *F;  // Pointer to the outlined function
 
   /// Helper Functions
   static RTFType getRTFunction(Function *F) {
@@ -155,291 +70,242 @@ struct OMPInfo {
     return false;
   }
 
-  const StringRef getCBName() const {
-    if (CB)
-      return CB->getCalledFunction()->getName();
-    return "";
-  }
-
-  const StringRef getFName() const {
-    if (F)
-      return F->getName();
-    return "";
-  }
-
-  const Function *getCBFunction() const {
-    if (CB)
-      return CB->getCalledFunction();
-    return nullptr;
+  static bool isRTFunction(CallBase &CB) {
+    auto RT = getRTFunction(CB);
+    if (RT != RTFType::OTHER)
+      return true;
+    return false;
   }
 };
 
-/// EDT DEP 
-struct EDTInfo;
-struct EDTDep {
+/// DATA ENVIRONMENT
+/// Struct to store information about the data environment of an Edt Region.
+/// The value is usually a Function argument, but it can be any value.
+struct DataEnv {
+  enum Type { OTHER = 0, PRIVATE, SHARED, FIRSTPRIVATE, LASTPRIVATE, NONE };
   /// Interface 
-  EDTDep() : EDT(nullptr){};
-  EDTDep(EDTInfo *EDT) : EDT(EDT){};
-  // EDTDep(EDTInfo *EDT, DataEnv *DE) : EDT(EDT), DE(DE) {};
+  DataEnv(){};
+  DataEnv(DataEnv &DE) { append(DE); };
+  DataEnv &operator=(const DataEnv &DE) {
+    Privates = DE.Privates;
+    Shareds = DE.Shareds;
+    FirstPrivates = DE.FirstPrivates;
+    LastPrivates = DE.LastPrivates;
+    return *this;
+  }
+
+  void append(const DataEnv &DE) {
+    Privates.insert(DE.Privates.begin(), DE.Privates.end());
+    Shareds.insert(DE.Shareds.begin(), DE.Shareds.end());
+    FirstPrivates.insert(DE.FirstPrivates.begin(),
+                            DE.FirstPrivates.end());
+    LastPrivates.insert(DE.LastPrivates.begin(),
+                           DE.LastPrivates.end());
+  };
+
+  /// Given a Value, it returns if it is in the Data Environment
+  bool isInDE(Value *V) {
+    if (Privates.count(V) || Shareds.count(V) ||
+        FirstPrivates.count(V) || LastPrivates.count(V))
+      return true;
+    return false;
+  }
+
+  /// Insert Value to the Data Environment
+  void insertValue(Value *V, Type Ty) {
+    switch (Ty) {
+    case Type::PRIVATE:
+      Privates.insert(V);
+      break;
+    case Type::SHARED:
+      Shareds.insert(V);
+      break;
+    case Type::FIRSTPRIVATE:
+      FirstPrivates.insert(V);
+      break;
+    case Type::LASTPRIVATE:
+      LastPrivates.insert(V);
+      break;
+    default:
+      break;
+    }
+  }
+
+  /// Given a Value, it returns the Type
+  Type getType(Value *V) {
+    if (Privates.count(V))
+      return Type::PRIVATE;
+    if (Shareds.count(V))
+      return Type::SHARED;
+    if (FirstPrivates.count(V))
+      return Type::FIRSTPRIVATE;
+    if (LastPrivates.count(V))
+      return Type::LASTPRIVATE;
+    return Type::NONE;
+  }
 
   /// Attributes 
-  // EDT where the value will be signaled to
-  EDTInfo *EDT;
+  SetVector<Value *> Privates;
+  SetVector<Value *> Shareds;
+  SetVector<Value *> FirstPrivates;
+  SetVector<Value *> LastPrivates;
+};
+
+inline raw_ostream &operator<<(raw_ostream &OS, DataEnv &DE) {
+  OS << "Data environment: \n";
+  OS << "Firstprivate: " << DE.FirstPrivates.size() << "\n";
+  for (auto *V : DE.FirstPrivates)
+    OS << "  - " << *V << "\n";
+  OS << "Private: " << DE.Privates.size() << "\n";
+  for (auto *V : DE.Privates)
+    OS << "  - " << *V << "\n";
+  OS << "Shared: " << DE.Shareds.size() << "\n";
+  for (auto *V : DE.Shareds)
+    OS << "  - " << *V << "\n";
+  OS << "Lastprivate: " << DE.LastPrivates.size() << "\n";
+  for (auto *V : DE.LastPrivates)
+    OS << "  - " << *V << "\n";
+  return OS;
+}
+
+/// EDT DEP 
+struct EdtInfo;
+struct EdtDep {
+  /// Interface 
+  EdtDep() : Edt(nullptr){};
+  EdtDep(EdtInfo *Edt) : Edt(Edt){};
+  // EdtDep(EdtInfo *Edt, DataEnv *DE) : Edt(Edt), DE(DE) {};
+
+  /// Attributes 
+  // Edt where the value will be signaled to
+  EdtInfo *Edt;
   /// Values to be signaled
   SmallVector<Value *, 4> Values;
 };
 
 /// EDT INFO 
-struct EDTBlock {
-  enum BlockType { ENTRY = 0, INIT_ALLOCA, INIT, EVENT, OTHER };
+/// Struct to store information about Edts. This is not an Edt itself,
+/// but a representation of it. (E.G. A function that only accesses
+/// the information of its arguments is not an Edt, but it is represented
+/// by an EdtInfo object)
+struct EdtInfo {
+  /// Type
+  enum Type{ TASK, PARALLEL, WRAPPER, OTHER };
+
   /// Interface 
-  EDTBlock(EDTInfo *EDT) : EDT(EDT), Type(OTHER), BB(nullptr){};
-  EDTBlock(EDTInfo *EDT, BlockType Type, BasicBlock *BB)
-      : EDT(EDT), Type(Type), BB(BB){};
-  EDTBlock(EDTBlock &B) : EDT(B.EDT), Type(B.Type), BB(B.BB){};
-
-  void setOMPInfo(OMPInfo &OMPI) {
-    HasOMP = true;
-    OMP = OMPI;
-  }
-
-  bool isInSameEDT(EDTBlock &B) { return (EDT == B.EDT); }
-
-  bool isInit() { return (Type == INIT); }
-  bool isEntry() { return (Type == ENTRY); }
-  bool isOther() { return (Type == OTHER); }
-  bool isInitAlloca() { return (Type == INIT_ALLOCA); }
-
-  /// Attributes 
-  /// Pointer to EDT where the EDTBlock belongs
-  EDTInfo *EDT;
-  /// Type of the EDTBlock
-  BlockType Type;
-  /// BasicBlock of the EDTBlock
-  BasicBlock *BB;
-  /// Flag to indicate if the EDT has OpenMP RT calls
-  bool HasOMP = false;
-  /// OpenMP information of the EDT
-  OMPInfo OMP;
-
-  /// Flag to indicate if the EDTBlock was Transformed
-  bool Transformed = false;
-  /// Flag to indicate if the EDTBlock was Analyzed
-  bool Analyzed = false;
-};
-
-inline raw_ostream &operator<<(raw_ostream &OS, EDTBlock &EB) {
-  StringRef Transformed = EB.Transformed ? "True: " : "False";
-  OS << "-- EDTBlock --\n";
-  OS << "  - BB Name: " << EB.BB->getName() << "\n";
-  OS << "  - Block Type: ";
-  if (EB.Type == EDTBlock::INIT_ALLOCA)
-    OS << "Init Alloca";
-  else if (EB.Type == EDTBlock::INIT)
-    OS << "Init";
-  else if (EB.Type == EDTBlock::EVENT)
-    OS << "Event";
-  else if (EB.Type == EDTBlock::ENTRY)
-    OS << "Entry";
-  else
-    OS << "Other";
-  OS << "\n";
-  const char *HasOMP = EB.HasOMP ? "True" : "False";
-  OS << "  - OMP: " << HasOMP << "\n";
-  OS << "  - Transformed: " << Transformed;
-  OS << *EB.BB;
-  return OS;
-}
-
-/// EDT INFO 
-/// Struct to store information about EDTs
-struct EDTInfo {
-  /// Interface 
-  EDTInfo(uint64_t ID) : ID(ID){};
-  EDTInfo(uint64_t ID, Function *F, DataEnv DE) : ID(ID), F(F), DE(DE){};
-
-  EDTBlock *insertEDTBlock(EDTBlock::BlockType Ty, BasicBlock *BB) {
-    EDTBlock *EDTB = new EDTBlock(this, Ty, BB);
-    if(Ty == EDTBlock::INIT_ALLOCA)
-      InitAlloca = EDTB;
-    /// Add it to the map
-    Blocks.insert(EDTB);
-    return EDTB;
-  }
-
-  void addDep(EDTDep *SI) { Deps.insert(SI); }
+  EdtInfo(Type Ty, uint64_t ID) : Ty(Ty), ID(ID){};
+  EdtInfo(Type Ty, uint64_t ID, Function *F) : ID(ID), F(F){};
 
   void setF(Function *F) { this->F = F; }
+  Type getType() { return Ty; }
 
   /// Attributes 
-  /// GUID of the EDT
+  /// Edt Type
+  Type Ty = Type::OTHER;
+  /// GUID of the Edt
   uint64_t ID;
-  /// Pointer to the EDT function
+  /// Pointer to the Edt function
   Function *F = nullptr;
-  /// Data environment of the EDT
+  /// Data environment of the Edt
   DataEnv DE;
-  /// Pointer to Init EDTBlock. It is used to know who created the EDT
-  EDTBlock *Init = nullptr;
-  /// Pointer to InitAlloca EDTBlock. It is used to know where to create
-  /// the GUIDs.
-  EDTBlock *InitAlloca = nullptr;
-  /// Indicates if the EDT was analyzed or not
-  bool Analyzed = false;
-  /// List of EDT Dependencies - successors
-  SmallPtrSet<EDTDep *, 4> Deps;
-  /// List of BasicBlocks that are part of the EDT
-  SmallPtrSet<EDTBlock *, 4> Blocks;
-  /// Set of instructions that may read or write to memory
-  SmallPtrSet<Instruction *, 4> RWInsts;
-  /// Set of used instructions with values not declared in the EDT
-  SmallPtrSet<Instruction *, 4> ExtInsts;
+  /// Indicates if the Edt transformed to an ARTS Edt or not
+  bool Transformed = false;
 };
 
-inline raw_ostream &operator<<(raw_ostream &OS, EDTInfo &EI) {
-  OS << "----- EDT -----\n";
+inline raw_ostream &operator<<(raw_ostream &OS, EdtInfo &EI) {
+  OS << "----- Edt -----\n";
   OS << "ID: " << EI.ID << "\n";
-  OS << "Number of Deps: " << EI.Deps.size() << "\n";
-  for (auto *Dep : EI.Deps) {
-    OS << "  - " << Dep->EDT->ID << "\n";
+  OS << "Function: " << EI.F->getName() << "\n";
+  OS << "Type: ";
+  switch (EI.Ty) {
+  case EdtInfo::Type::TASK:
+    OS << "TASK";
+    break;
+  case EdtInfo::Type::PARALLEL:
+    OS << "PARALLEL";
+    break;
+  case EdtInfo::Type::WRAPPER:
+    OS << "WRAPPER";
+    break;
+  case EdtInfo::Type::OTHER:
+    OS << "OTHER";
+    break;
   }
-  OS << "Number of RWInsts: " << EI.RWInsts.size() << "\n";
-  for (auto *I : EI.RWInsts) {
-    OS << "  - " << *I << "\n";
-  }
-  OS << "Number of ExtInsts: " << EI.ExtInsts.size() << "\n";
-  for (auto *I : EI.ExtInsts) {
-    OS << "  - " << *I << "\n";
-  }
-  OS << "Number of Blocks: " << EI.Blocks.size() << "\n";
-  for (auto *B : EI.Blocks) {
-    OS << *B << "\n";
-  }
+  OS << "\n";
+  OS << EI.DE;
   return OS;
 }
-
 
 /// ARTS TRANSFORM 
 struct ARTSTransformer {
+  friend struct EdtInfo;
   /// Interface 
   ARTSTransformer(Module &M) : M(M) {}
   ~ARTSTransformer() {
-    /// Delete EDTs
-    // for (const auto &It : EDTBlocks)
+    /// Delete Edts
+    // for (const auto &It : EdtBlocks)
     //   delete (It.second);
-    // EDTBlocks.clear();
+    // EdtBlocks.clear();
   }
   bool run(FunctionAnalysisManager &FAM);
   bool runAttributor(Attributor &A);
 
   /// Helper Functions 
-  /// Insert CB to analyze
-  void insertCB(CallBase *CB) { CBs.insert(CB); }
+
+  /// Create Edt
+  EdtInfo *insertEdt(EdtInfo::Type Ty, Function *F) {
+    EdtInfo *Edt = new EdtInfo(Ty, EdtItr++, F);
+    EdtTypeToFunction[Ty] = F;
+    EdtForFunction[F] = Edt;
+    return Edt;
+  }
+
+  /// Get Edt
+  EdtInfo *getEdt(Function *F) {
+    if (EdtForFunction.count(F))
+      return EdtForFunction[F];
+    return nullptr;
+  }
+
+  /// Insert Type for Argument
+  void insertArgToDE(Argument *Arg, DataEnv::Type Type,  DataEnv &DE) {
+    DE.insertValue(Arg, Type);
+    TypeForArg[Arg] = Type;
+  }
+
+  void insertArgToDE(Argument *Arg, DataEnv::Type Type, EdtInfo &Edt) {
+    insertArgToDE(Arg, Type, Edt.DE);
+  }
+
+  /// Get Argument Type
+  DataEnv::Type getType(Argument *Arg) {
+    if (TypeForArg.count(Arg))
+      return TypeForArg[Arg];
+    return DataEnv::Type::NONE;
+  }
   
-  /// Insert EDT
-  EDTInfo *insertEDT(Function *F, EDTBlock *Init = nullptr) {
-    EDTInfo *EDTI = new EDTInfo(EDTID++);
-    if (Init) {
-      assert(Init->Type == EDTBlock::BlockType::INIT &&
-             "Init block must be of type INIT");
-      EDTI->Init = Init;
-    }
-    EDTs.insert(EDTI);
-    EDTsFromFunction[F].insert(EDTI);
-    return EDTI;
-  }
-
-  void insertDep(EDTInfo *From, EDTInfo *To) {
-    /// Create dependency
-    EDTDep *SI = new EDTDep(To);
-    From->addDep(SI);
-  }
-
-  /// EDTBlock helper functions. 
-  /// Return the EDTBlock for a given BB or `nullptr` if there are
-  /// none.
-  EDTBlock *getEDTBlock(BasicBlock *BB) {
-    auto It = EDTBlocks.find(BB);
-    if (It != EDTBlocks.end())
-      return (It->second);
-    return nullptr;
-  }
-
-  EDTBlock *getEDTBlock(Instruction *I) { return getEDTBlock(I->getParent()); }
-
-  /// Create EDTBlock and insert it into the EDT and map
-  EDTBlock *insertEDTBlock(EDTInfo *EI, EDTBlock::BlockType Ty,
-                           BasicBlock *BB) {
-    /// Insert EDT block
-    EDTBlock *EDTB = EI->insertEDTBlock(Ty, BB);
-    /// Add it to the map
-    auto It = EDTBlocks.find(BB);
-    if (It != EDTBlocks.end())
-      delete (It->second);
-    EDTBlocks.insert(std::make_pair(BB, EDTB));
-    /// Return EDT block
-    return EDTB;
-  }
-
-  /// Create EDTBlock and insert it into the EDT and map
-  EDTBlock *insertEDTBlock(EDTInfo *EI, EDTBlock::BlockType Ty, BasicBlock *BB,
-                           OMPInfo &OMP) {
-    EDTBlock *EDTB = insertEDTBlock(EI, Ty, BB);
-    EDTB->setOMPInfo(OMP);
-    return EDTB;
-  }
-
-  /// Get EDT for function
-  EDTInfo *getEDTForFunction(Function *F) {
-    auto It = EDTForFunction.find(F);
-    if (It != EDTForFunction.end())
-      return It->second;
-    return nullptr;
-  }
-
-  /// Insert EDT for function
-  void insertEDTForFunction(Function *F, EDTInfo *EDTI) {
-    EDTForFunction.insert(std::make_pair(F, EDTI));
-  }
-
-  /// RWInsts Map 
-  void insertRWInst(Function *F, Instruction *I) {
-    RWInsts[F].insert(I);
-    EDTBlock *EDTB = getEDTBlock(I);
-    EDTB->EDT->RWInsts.insert(I);
-  }
 
   /// Attributes 
   /// The underlying module.
   Module &M;
-  /// Set of CB to analyze
-  SmallPtrSet<CallBase *, 4> CBs;
-  /// Set of valid functions in the module.
-  // SetVector<Function *> &Functions;
-  /// List of EDTs
-  uint64_t EDTID = 0;
-  SmallPtrSet<EDTInfo *, 4> EDTs;
-  /// Maps the basic block to the EDT Block
-  DenseMap<BasicBlock *, EDTBlock *> EDTBlocks;
-  /// Maps a function to the set of EDTs that were created from it.
-  /// For example, if inside the main function there is a parallel region
-  /// 2 EDTs will be created from it: one for the parallel region and one for
-  /// the outlined function.
-  DenseMap<Function *, SmallPtrSet<EDTInfo *, 4>> EDTsFromFunction;
-  /// Maps a function to the EDT that represents it.
-  /// There are EDTs that represent the same function. This map is used to
-  /// identify them.
-  DenseMap<Function *, EDTInfo *> EDTForFunction;
-  /// Maps a function to set the instructions that may read or write to memory
-  DenseMap<Function *, SmallPtrSet<Instruction *, 4>> RWInsts;
+
+  /// Edt Counter
+  uint64_t EdtItr = 0;
+  /// Maps the EdtType to the function
+  DenseMap<uint8_t, Function *> EdtTypeToFunction;
+  /// Maps the Function to the EdtInfo that represents it
+  DenseMap<Function *, EdtInfo *> EdtForFunction;
+  /// Maps a Function Argument to a DataEnvironment Type
+  DenseMap<Argument *, DataEnv::Type> TypeForArg;
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS,
-                               SmallPtrSet<EDTInfo *, 4> &EDTs) {
-  OS << "DUMPING EDTs\n";
-  OS << "Number of EDTs: " << EDTs.size() << "\n";
-  for (auto *E : EDTs) {
-    OS << "\n" << *E;
-  }
+                               SmallPtrSet<EdtInfo *, 4> &Edts) {
+  OS << "DUMPING Edts\n";
+  // OS << "Number of Edts: " << Edts.size() << "\n";
+  // for (auto *E : Edts) {
+  //   OS << "\n" << *E;
+  // }
   return OS;
 }
 

@@ -53,18 +53,18 @@ public:
 
   /// Creates EDT Function. It creates an empty function with the
   /// correct signature and returns it.
-  Function *createEDT(StringRef Name);
+  Function *createEdt(StringRef Name);
 
   /// Given a EDT Block and a EDT Function, it inserts the Basic Block
   /// into the Function.
-  void insertEDTBlock(EDTBlock *EB, Function *EDTFunc);
+  // void insertEDTBlock(EDTBlock *EB, Function *EDTFunc);
 
 
 
   /// Initializes EDT Function. It inserts the call to the
   /// runtime function to reserve the GUID for the EDT, then it calls 
   /// artsEdtCreateWithGuid to create the EDT. 
-  Function *initializeEDT(EDTInfo &EDTI, Function *EDTFunc,
+  Function *initializeEDT(EdtInfo &EDTI, Function *EDTFunc,
                           BasicBlock *CurBB = nullptr);
   AllocaInst *reserveEDTGuid(BasicBlock *EntryBB, uint32_t Node);
 

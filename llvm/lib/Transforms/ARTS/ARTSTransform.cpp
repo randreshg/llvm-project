@@ -2,6 +2,7 @@
 #include "llvm/Transforms/ARTS/ARTSTransform.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CallGraphSCCPass.h"
@@ -83,331 +84,6 @@ struct ARTSInformationCache : public InformationCache {
   ARTSIRBuilder ARTSBuilder;
 };
 
-/// AADataEnv
-/// This AbstractAttribute is used to obtain the data environment of a code
-/// region, which is the set of variables that are private, shared, firstprivate
-/// and lastprivate.
-struct AADataEnv : public StateWrapper<BooleanState, AbstractAttribute> {
-  using Base = StateWrapper<BooleanState, AbstractAttribute>;
-
-  AADataEnv(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
-
-  /// Statistics are tracked as part of manifest for now.
-  void trackStatistics() const override {}
-
-  static AADataEnv &createForPosition(const IRPosition &IRP, Attributor &A);
-
-  /// See AbstractAttribute::getName()
-  const std::string getName() const override { return "AADataEnv"; }
-
-  /// See AbstractAttribute::getIdAddr()
-  const char *getIdAddr() const override { return &ID; }
-
-  /// This function should return true if the type of the \p AA is
-  /// AADataEnv
-  static bool classof(const AbstractAttribute *AA) {
-    return (AA->getIdAddr() == &ID);
-  }
-
-  static const char ID;
-};
-
-struct AADataEnvCallSite : AADataEnv {
-  AADataEnvCallSite(const IRPosition &IRP, Attributor &A) : AADataEnv(IRP, A) {}
-
-  const std::string getAsStr(Attributor *A) const override {
-    if (!isValidState())
-      return "<invalid>";
-
-    std::string Str("AADataEnvCallSite: ");
-    return Str + "OK";
-  }
-
-  ChangeStatus handleParallelRegion(CallBase &CB, Attributor &A) {
-    /// Get the number of arguments
-    uint32_t NumArgs = CB.data_operands_size();
-    /// Get private and shared variables
-    for (uint32_t ArgItr = 3; ArgItr < NumArgs; ArgItr++) {
-      Value *Arg = CB.getArgOperand(ArgItr);
-      Type *ArgType = Arg->getType();
-      // LLVM_DEBUG(dbgs() << "Argument: " << *Arg << "\n");
-      // LLVM_DEBUG(dbgs() << "Argument type: " << *ArgType << "\n");
-
-      /// For now assume that if it is a pointer, it is a shared variable
-      if (PointerType *PT = dyn_cast<PointerType>(ArgType))
-        DE.Shareds.insert(Arg);
-      /// If not, it is a first private variable
-      else
-        DE.FirstPrivates.insert(Arg);
-
-      /// NOTES: The outline function or the variable should have attributes
-      /// that provide more information about the lifetime of the variable. It
-      /// is also important to consider the underlying type of the variable.
-      /// There may be cases, where there is a firstprivate variable that is a
-      /// pointer. For this case, the pointer is private, but the data it points
-      /// to is shared.
-      ///
-      /// Do we need to consider private variables?
-    }
-    /// For now, indicate optimistic fixpoint
-    indicateOptimisticFixpoint();
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Parallel region - Data "
-                         "environment filled out\n");
-    return ChangeStatus::CHANGED;
-  }
-
-  ChangeStatus handleTaskRegion(CallBase &CB, Attributor &A) {
-    // For the shared variables we are interested, in all stores that are done
-    // to the shareds field of the kmp_task_t struct. For the firstprivate
-    // variables we are interested in all stores that are done to the privates
-    // field of the kmp_task_t_with_privates struct.
-    //
-    // The AAPointerInfo attributor is used to obtain the access (read/write,
-    // offsets and size) of a Val. This attributor is run on the returned Val
-    // of the taskalloc function. The returned Val is a pointer to the
-    // kmp_task_t_with_privates struct.
-    // struct kmp_task_t_with_privates {
-    //    kmp_task_t task_data;
-    //    kmp_privates_t privates;
-    // };
-    // typedef struct kmp_task {
-    //   void *shareds;
-    //   kmp_routine_entry_t routine;
-    //   kmp_int32 part_id;
-    //   kmp_cmplrdata_t data1;
-    //   kmp_cmplrdata_t data2;
-    // } kmp_task_t;
-    //
-    // - For shared variables, the access of the shareds field is obtained by
-    // obtaining stores done to offset 0 of the returned Val of the taskalloc.
-    // -For firstprivate variables, the access of the privates field is obtained
-    // by obtaining stores done to offset 8 of the returned Val of the
-    // kmp_task_t_with_privates struct.
-    //
-    // If there is a load instruction that uses the returned Val of the
-    // taskalloc function, we need to run the AAPointerInfo attributor on it.
-    //
-    // The function returns ChangeStatus::CHANGED if the data environment is
-    // updated, ChangeStatus::UNCHANGED otherwise.
-
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Task alloc - FOUND\n");
-    /// Get context and module
-    LLVMContext &Ctx = CB.getContext();
-    Module *M = CB.getModule();
-    /// Get the size of the kmp_task_t struct
-    auto *TaskStruct = dyn_cast<StructType>(CB.getType());
-    auto SharedsSize = M->getDataLayout().getTypeAllocSize(
-        TaskStruct->getTypeByName(Ctx, "struct.kmp_task_t"));
-    /// Run AAPointerInfo on the callbase
-    auto *PI = A.getAAFor<AAPointerInfo>(
-        *this, IRPosition::callsite_returned(CB), DepClassTy::OPTIONAL);
-    if (!PI->getState().isValidState()) {
-      indicatePessimisticFixpoint();
-      LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] AAPointerInfo is invalid\n");
-      return Changed;
-    }
-    /// Is it a fixpoint?
-    if (!PI->getState().isAtFixpoint()) {
-      LLVM_DEBUG(
-          dbgs() << "[AADataEnvCallSite] AAPointerInfo is not at fixpoint\n");
-      return Changed;
-    }
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] AAPointerInfo is valid with: "
-                      << PI->getOffsetBinsSize() << " bins\n");
-    /// Analyze result
-    /// This CB checks the access of each offset bin of PI
-    const std::function<bool(const AA::RangeTy &, const SmallSet<unsigned, 4> &,
-                             const AAPointerInfo *AAPI)>
-        AccessCB = [&](const AA::RangeTy &Range,
-                       const SmallSet<unsigned, 4> &AccIndex,
-                       const AAPointerInfo *AAPI) {
-          LLVM_DEBUG(dbgs()
-                      << "[" << Range.Offset << "-" << Range.Offset +
-                      Range.Size
-                      << "] : " << AccIndex.size() << "\n");
-          for (auto AI : AccIndex) {
-            auto &Acc = AAPI->getAccess(AI);
-            auto AccKind = Acc.getKind();
-            auto *Inst = Acc.getLocalInst();
-
-            if (Acc.isWrittenValueYetUndetermined()) {
-              return false;
-            }
-            /// Store instruction.
-            if (AccKind == AAPointerInfo::AccessKind::AK_MUST_WRITE) {
-              Value *Val = Acc.getWrittenValue();
-              LLVM_DEBUG(dbgs() << "    - Written value: " << *Val << "\n");
-              if (!Val)
-                return false;
-              /// Check if it is a shared variable
-              if (Range.Offset == 0) {
-                DE.Shareds.insert(Val);
-              }
-              /// Check if it is a firstprivate variable
-              else if ((uint64_t)Range.Offset >= (uint64_t)SharedsSize) {
-                DE.FirstPrivates.insert(Val);
-              }
-            }
-            /// Read instruction
-            else if (AccKind == AAPointerInfo::AccessKind::AK_MUST_READ) {
-              if (auto *LI = dyn_cast<LoadInst>(Inst)) {
-                Value *Val = LI->getPointerOperand();
-                LLVM_DEBUG(dbgs() << "    - Read value: " << *Val << "\n");
-                auto *PIL = A.getAAFor<AAPointerInfo>(
-                    *this, IRPosition::value(*LI), DepClassTy::OPTIONAL);
-                if (!PIL->getState().isValidState()) {
-                  indicatePessimisticFixpoint();
-                  return false;
-                }
-                /// Is it a fixpoint?
-                if (!PIL->getState().isAtFixpoint()) {
-                  return false;
-                }
-                /// For all offset bins in the PI, run AccessCB
-                if (!PIL->forallOffsetBins(AccessCB)) {
-                  indicatePessimisticFixpoint();
-                  return false;
-                }
-              }
-            }
-          }
-          return true;
-        };
-
-    /// For all offset bins in the PI, run AccessCB
-    if (!PI->forallOffsetBins(AccessCB)) {
-      LLVM_DEBUG(dbgs() << "PI forallOffsetBins failed\n");
-      /// We dont indicate fixpoint here. The analysis could've failed because
-      /// PI is not at fixpoint.
-      return Changed;
-    }
-    LLVM_DEBUG(dbgs() << "-- " << CB.getCalledFunction()->getName()
-                      << ": \n" << DE);
-    /// If we reach this point, it means that the PI is valid and at fixpoint.
-    indicateOptimisticFixpoint();
-    return ChangeStatus::CHANGED;
-  }
-
-  ChangeStatus handleTaskwait() { return ChangeStatus::UNCHANGED; }
-
-  void initialize(Attributor &A) override {
-    CallBase &CB = cast<CallBase>(getAssociatedValue());
-    Function *Callee = getAssociatedFunction();
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] initialize: " << Callee->getName()
-                      << "\n");
-    /// Handle in the updateImpl function
-    // switch (OMPInfo::getRTFunction(Callee)) {
-    // case OMPInfo::SET_NUM_THREADS: {
-    //   auto *Arg = CB.getArgOperand(0);
-    //   if (auto *NumThreads = dyn_cast<ConstantInt>(Arg)) {
-    //     LLVM_DEBUG(dbgs() << "Number of threads: " << NumThreads->getZExtValue()
-    //                       << "\n");
-    //   }
-    //   indicateOptimisticFixpoint();
-    // } break;
-    // case OMPInfo::PARALLEL:
-    //   /// Handle it in the updateImpl function
-    //   break;
-    // case OMPInfo::TASKALLOC: {
-    //   /// The task is created by the taskalloc function, and it returns a
-    //   /// pointer to the task (check handleTaskRegion documentation ).
-    //   /// We need to obtain its data environment. Since this pointer is used in
-    //   /// functions that are not analyzable, and for purposes of this analysis
-    //   /// we are not interested on what happens inside those functions, we will
-    //   /// simply remove it. A pointer is captured by the call if it
-    //   /// makes a copy of any part of the pointer that outlives the call.
-    //   for (auto &U : CB.uses()) {
-    //     auto *User = U.getUser();
-    //     if (!isa<Instruction>(User))
-    //       continue;
-    //     if (auto *CBI = dyn_cast<CallInst>(User)) {
-    //       /// Remove the call instruction, we dont need it
-    //       if (OMPInfo::isTaskFunction(CBI->getCalledFunction())) {
-    //         CBI->eraseFromParent();
-    //       }
-    //     }
-    //   }
-    //   /// Lets handle the task in the updateImpl function
-    // } break;
-    // case OMPInfo::OTHER: {
-    //   LLVM_DEBUG(dbgs() << "Other instruction - FOUND\n");
-    //   /// Unknown caller or declarations are not analyzable, we give up.
-    //   if (!Callee || !A.isFunctionIPOAmendable(*Callee)) {
-    //     indicatePessimisticFixpoint();
-    //     LLVM_DEBUG(dbgs() << "Unknown caller or declarations are not "
-    //                          "analyzable, we give up.\n");
-    //     return;
-    //   }
-    // } break;
-    // /// Default
-    // default: {
-    //   LLVM_DEBUG(dbgs() << "Other instruction - FOUND\n");
-    // } break;
-    // }
-  }
-
-  ChangeStatus updateImpl(Attributor &A) override {
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    CallBase &CB = cast<CallBase>(getAssociatedValue());
-    Function *Callee = getAssociatedFunction();
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] updateImpl: " << Callee->getName()
-                      << "\n");
-
-    switch (OMPInfo::getRTFunction(Callee)) {
-      case OMPInfo::PARALLEL:
-        Changed |= handleParallelRegion(CB, A);
-        break;
-      case OMPInfo::TASKALLOC:
-        Changed |= handleTaskRegion(CB, A);
-        break;
-      default: {
-        LLVM_DEBUG(dbgs() << "Other instruction - FOUND\n");
-      } break;
-    }
-
-    // if (Changed == ChangeStatus::CHANGED) {
-    //   /// If the data environment is updated, update info in the cache
-    //   auto &AIC = static_cast<ARTSInformationCache &>(A.getInfoCache());
-    //   auto *EB = AIC.ARTSTransform.getEDTBlock(CB.getParent());
-    //   // auto &OMP = EB->OMP;
-    //   // OMP.DE.append(DE);
-    //   // OMP.F = OutlinedFunction;
-    // }
-    return Changed;
-  }
-
-  ChangeStatus manifest(Attributor &A) override {
-    ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    LLVM_DEBUG(dbgs() << "[AADataEnvCallSite] Manifest\n");
-    return Changed;
-  }
-
-  /// Data environment of the Region
-  DataEnv DE;
-  /// Given a value it maps it to its access (read/write, offsets and size)
-};
-
-AADataEnv &AADataEnv::createForPosition(const IRPosition &IRP, Attributor &A) {
-  AADataEnv *AA = nullptr;
-  switch (IRP.getPositionKind()) {
-  case IRPosition::IRP_INVALID:
-  case IRPosition::IRP_ARGUMENT:
-  case IRPosition::IRP_CALL_SITE_ARGUMENT:
-  case IRPosition::IRP_RETURNED:
-  case IRPosition::IRP_CALL_SITE_RETURNED:
-  case IRPosition::IRP_FLOAT:
-  case IRPosition::IRP_FUNCTION:
-    llvm_unreachable(
-        "AAToARTS can only be created for float/callsite position!");
-  case IRPosition::IRP_CALL_SITE:
-    AA = new (A.Allocator) AADataEnvCallSite(IRP, A);
-    break;
-  }
-  return *AA;
-}
-
-const char AADataEnv::ID = 0;
 
 /// AAToARTS
 /// This AbstractAttribute analyzes a given function and tries to determine
@@ -617,7 +293,7 @@ struct ARTSAnalyzer {
     CodeExtractorAnalysisCache CEAC(F);
     CodeExtractor CE(Region, DT, /* AggregateArgs */ false, /* BFI */ nullptr,
                      /* BPI */ nullptr, AC, /* AllowVarArgs */ false,
-                     /* AllowAlloca */ true, /* AllocaBlock */ nullptr,
+                     /* AllowAlloca */ false, /* AllocaBlock */ nullptr,
                      /* Suffix */ "");
 
     // SetVector<Value *> Inputs, Outputs, Sinks;
@@ -638,8 +314,8 @@ struct ARTSAnalyzer {
 
   /// It finds the BBs that are dominated by FromBB and add
   /// them to the DominatedBlocks vector.
-  void dominatedBBs(BasicBlock *FromBB, DominatorTree &DT,
-                    BlockSequence &DominatedBlocks) {
+  void getDominatedBBs(BasicBlock *FromBB, DominatorTree &DT,
+                       BlockSequence &DominatedBlocks) {
     Function &F = *FromBB->getParent();
     for (auto &ToBB : F) {
       if (DT.dominates(FromBB, &ToBB))
@@ -746,31 +422,37 @@ struct ARTSAnalyzer {
   /// module.
   Function *
   createFunction(DominatorTree *DT, BasicBlock *FromBB, bool DTAnalysis = false,
+                 std::string FunctionName = "",
                  SmallVector<Value *, 0> *ExcludeArgsFromAggregate = nullptr) {
     Function &F = *FromBB->getParent();
     AssumptionCache *AC = AG.getAnalysis<AssumptionAnalysis>(F, true);
     CodeExtractorAnalysisCache CEAC(F);
+  
     /// Collect blocks
     BlockSequence Region;
     /// Get all BBs that are dominated by FromBB
     if (DTAnalysis)
-      dominatedBBs(FromBB, *DT, Region);
+      getDominatedBBs(FromBB, *DT, Region);
     else
       Region.push_back(FromBB);
-    LLVM_DEBUG(dbgs() << TAG << "Creating function for: " << FromBB->getName()
-                      << " - " << Region.size() << "\n");
+
     /// Extract code from the region
     CodeExtractor CE(Region, DT, /* AggregateArgs */ false, /* BFI */ nullptr,
                       /* BPI */ nullptr, AC, /* AllowVarArgs */ false,
-                      /* AllowAlloca */ true, /* AllocaBlock */ nullptr,
-                      /* Suffix */ "edt");
-    assert(CE.isEligible() && "Expected Region outlining to be possible!");
+                      /* AllowAlloca */ true, /* AllocaBlock */ nullptr);
 
+    assert(CE.isEligible() && "Expected Region outlining to be possible!");
+  
     if (ExcludeArgsFromAggregate)
       for (auto *V : *ExcludeArgsFromAggregate)
         CE.excludeArgFromAggregate(V);
+
     /// Generate function
     Function *OutF = CE.extractCodeRegion(CEAC);
+    if(FunctionName != "")
+      OutF->setName(FunctionName);
+  
+    // LLVM_DEBUG(dbgs() << TAG << "Function created: " << OutF->getName() << "\n");
     return OutF;
   }
 
@@ -787,7 +469,6 @@ struct ARTSAnalyzer {
     /// Remove arguments from the outlined function
     for (uint32_t ArgItr = 0; ArgItr < KeepArgsFrom; ArgItr++) {
       Value *Arg = OldFn->args().begin() + ArgItr;
-      // replaceValueWithUndef(Arg, true, false);
       removeValue(Arg, true, false);
     }
 
@@ -814,10 +495,12 @@ struct ARTSAnalyzer {
     Function *NewFn = Function::Create(NewFnTy, OldFn->getLinkage(),
                                        OldFn->getAddressSpace(), "");
     OldFn->getParent()->getFunctionList().insert(OldFn->getIterator(), NewFn);
-    NewFn->takeName(OldFn);
+    // NewFn->takeName(OldFn);
     NewFn->setName("parallel.edt");
     OldFn->setSubprogram(nullptr);
-    OldFn->setMetadata("dbg", nullptr);
+
+    // Create Parallel EDT
+    EdtInfo &ParallelEDT = *AT.insertEdt(EdtInfo::PARALLEL, NewFn);
 
     // Since we have now created the new function, splice the body of the old
     // function right into the new function, leaving the old rotting hulk of the
@@ -857,6 +540,22 @@ struct ARTSAnalyzer {
          ++OldArgNum, ++OldFnArgIt) {
       NewFnArgIt->takeName(&*OldFnArgIt);
       OldFnArgIt->replaceAllUsesWith(&*NewFnArgIt);
+      /// Add to Parallel EDT Data Environment
+      Argument *Arg = &*OldFnArgIt;
+      Type *ArgType = NewFnArgIt->getType();
+      /// For now assume that if it is a pointer, it is a shared variable
+      if (PointerType *PT = dyn_cast<PointerType>(ArgType))
+        AT.insertArgToDE(Arg, DataEnv::SHARED, ParallelEDT);
+      /// If not, it is a first private variable
+      else
+        AT.insertArgToDE(Arg, DataEnv::FIRSTPRIVATE, ParallelEDT);
+
+      /// NOTES: The outline function or the variable should have attributes
+      /// that provide more information about the lifetime of the variable. It
+      /// is also important to consider the underlying type of the variable.
+      /// There may be cases, where there is a firstprivate variable that is a
+      /// pointer. For this case, the pointer is private, but the data it points
+      /// to is shared.
       ++NewFnArgIt;
     }
 
@@ -904,7 +603,6 @@ struct ARTSAnalyzer {
     // The function returns ChangeStatus::CHANGED if the data environment is
     // updated, ChangeStatus::UNCHANGED otherwise.
 
-    OMPInfo OI(OMPInfo::TASK, CB);
     const uint32_t TaskOutlinedFunctionPos = 5;
     /// Maps a value to an offset in the task data
     DenseMap<Value *, int64_t> ValueToOffsetTD;
@@ -922,6 +620,7 @@ struct ARTSAnalyzer {
 
     /// Analyze Task Data
     /// This analysis assumes we only have stores to the task struct
+    DataEnv TaskInfoDE;
     BasicBlock *BB = CB->getParent();
     for (Instruction &I : *BB) {
       if (&I == CB)
@@ -936,12 +635,12 @@ struct ARTSAnalyzer {
       ValueToOffsetTD[Val] = Offset;
 
       /// Private variables
-      if(Offset > TaskDataSize) {
-        OI.DE.Privates.insert(Val);
+      if(Offset >= TaskDataSize) {
+        TaskInfoDE.Privates.insert(Val);
         continue;
       }
       /// Shared variables
-      OI.DE.Shareds.insert(Val);
+      TaskInfoDE.Shareds.insert(Val);
     }
 
     /// Analyze Outlined Function
@@ -1016,6 +715,9 @@ struct ARTSAnalyzer {
     OutlinedFn->setSubprogram(nullptr);
     OutlinedFn->setMetadata("dbg", nullptr);
 
+    /// Create Edt for new function
+    EdtInfo &TaskEdt = *AT.insertEdt(EdtInfo::TASK, NewFn);
+
     /// Move BB to new function
     NewFn->splice(NewFn->begin(), OutlinedFn);
     /// Rewire the function arguments.
@@ -1023,6 +725,9 @@ struct ARTSAnalyzer {
     for (auto TDItr : ValueToOffsetTD) {
       Value *V = OffsetToValueOF[TDItr.second];
       V->replaceAllUsesWith(NewFnArgItr);
+      /// Add to Task data environment
+      DataEnv::Type Type = TaskInfoDE.getType(TDItr.first);
+      AT.insertArgToDE(&*NewFnArgItr, Type, TaskEdt);
       ++NewFnArgItr;
     }
 
@@ -1037,9 +742,9 @@ struct ARTSAnalyzer {
         CallInst::Create(NewFn, NewCallArgs, std::nullopt, "", LastInstruction);
     NewCI->setTailCallKind(cast<CallInst>(CB)->getTailCallKind());
     LLVM_DEBUG(dbgs() << " - New CB: " << *NewCI << "\n");
-  
+    LLVM_DEBUG(dbgs() << TaskEdt.DE << "\n");
+
     /// Remove Argument 0 and 1 from Original Task Outlined Function
-    // LLVM_DEBUG(dbgs() << " - Removing arguments from Outlined function\n");
     replaceValueWithUndef(OutlinedFn->getArg(0), true);
     replaceValueWithUndef(OutlinedFn->getArg(1), true);
     ValuesToRemove.push_back(CB);
@@ -1057,6 +762,83 @@ struct ARTSAnalyzer {
     if(!identifyEDTs(*NewFn))
       return false;
     return true;
+  }
+
+  /// Handles the done region and return next BB to analyze
+  BasicBlock *handleDoneRegion(BasicBlock *DoneBB, DominatorTree *DT, 
+                               std::string PrefixName, std::string SuffixBB) {
+    LLVM_DEBUG(dbgs() << "\n" <<  TAG << "Handling done region\n");
+    /// Get first instruction of BB to analyze if we need a new function
+    Instruction *FirstI = &*DoneBB->begin();
+
+    /// If the BB only has a return instruction, we can just remove it, and
+    /// add the return instruction to the predecessor
+    // if (isa<ReturnInst>(FirstI)) {
+    //   LLVM_DEBUG(dbgs() << TAG << " - Removing return instruction\n");
+    //   /// Get predecessor and add return void
+    //   BasicBlock *PredBB = DoneBB->getUniquePredecessor();
+    //   assert(PredBB && "Expected only one predecessor");
+    //   auto *PredBBTerminator = PredBB->getTerminator();
+    //   IRBuilder<> Builder(PredBBTerminator);
+    //   Builder.CreateRetVoid();
+    //   /// Remove BB
+    //   PredBBTerminator->eraseFromParent();
+    //   DoneBB->eraseFromParent();
+    //   return PredBB;
+    // }
+
+    /// If it is a callbase, check if its a call to a RT function
+    if(auto *CB = dyn_cast<CallBase>(FirstI)) {
+      if(OMPInfo::isRTFunction(*CB))
+        return DoneBB;
+      /// TODO: What about other callbase?
+    }
+
+    /// Handle other instructions
+    auto DoneFnName = PrefixName + "edt.done";
+    Function *DoneFunction = createFunction(DT, DoneBB, true, DoneFnName);
+    // LLVM_DEBUG(dbgs() << "Done Function: " << *DoneFunction << "\n");
+    /// Analyze Data Environment
+    BlockSequence DoneRegion;
+    for (auto &BB : *DoneFunction)
+      DoneRegion.push_back(&BB);
+    SetVector<Value *> Inputs, Outputs, Sinks;
+    getInputsOutputs(DoneRegion, DT, Inputs, Outputs, Sinks);
+
+    /// Get caller of the Done function, and rename BB to par.done
+    auto DoneBBName = PrefixName + "done." + SuffixBB;
+    CallBase *DoneCB = dyn_cast<CallBase>(DoneFunction->user_back());
+    auto *NewDoneBB = DoneCB->getParent();
+    NewDoneBB->setName(DoneBBName);
+
+    /// Analyze the instructions of the Done function
+    identifyEDTs(*DoneFunction);
+    return NewDoneBB->getNextNode();
+  }
+
+  void removeLifetimeMarkers(Function &F) {
+    for (auto &BB : F) {
+      auto InstIt = BB.begin();
+      auto InstEnd = BB.end();
+
+      while (InstIt != InstEnd) {
+        auto NextIt = InstIt;
+        ++NextIt;
+
+        if (auto *IT = dyn_cast<IntrinsicInst>(&*InstIt)) {
+          switch (IT->getIntrinsicID()) {
+          case Intrinsic::lifetime_start:
+          case Intrinsic::lifetime_end:
+            IT->eraseFromParent();
+            break;
+          default:
+            break;
+          }
+        }
+
+        InstIt = NextIt;
+      }
+    }
   }
 
   /// This function identifies the EDTs in the function
@@ -1100,6 +882,9 @@ struct ARTSAnalyzer {
     /// contains the call to the function that creates the region (e.g.
     /// __kmpc_fork_call) and the Val is the struct EDTInfo. Aux variables
 
+    /// Remove of lifetime markers
+    removeLifetimeMarkers(F);
+  
     /// Aux variables
     LoopInfo *LI = nullptr;
     DominatorTree *DT = AG.getAnalysis<DominatorTreeAnalysis>(F);
@@ -1127,49 +912,55 @@ struct ARTSAnalyzer {
         if (!CB)
           continue;
         /// Get the callee
-        Function *Callee = CB->getCalledFunction();
-        OMPInfo::RTFType RTF = OMPInfo::getRTFunction(Callee);
+        OMPInfo::RTFType RTF = OMPInfo::getRTFunction(*CB);
         switch (RTF) {
         case OMPInfo::PARALLEL: {
           LLVM_DEBUG(dbgs() << TAG << "Parallel Region Found: " << "\n  "
                             <<  *CB << "\n");
+
           /// Split block at __kmpc_parallel
-          auto ParallelName = "par.region." + std::to_string(ParallelRegion);
-          BasicBlock *ParallelBB =
-              SplitBlock(CurrentI->getParent(), CurrentI, DT, LI, nullptr,
-                          ParallelName);
+          auto ParallelItrStr = std::to_string(ParallelRegion++);
+          auto ParallelName = "par.region." + ParallelItrStr;
+          BasicBlock *ParallelBB;
+          if(CurrentI != &(CurrentBB->front())) {
+            ParallelBB = SplitBlock(
+              CurrentI->getParent(), CurrentI, DT, LI, nullptr, ParallelName);
+          }
+          else {
+            ParallelBB = CurrentBB;
+            ParallelBB->setName(ParallelName);
+          }
+  
           /// Split block at the next instruction
           CurrentI = CurrentI->getNextNonDebugInstruction();
-          auto ParallelDoneName =
-              "par.done." + std::to_string(ParallelRegion);
-          BasicBlock *ParallelDone =
+
+          /// Analyze Done Region
+          if(!isa<ReturnInst>(CurrentI)) {
+            BasicBlock *ParallelDone =
               SplitBlock(ParallelBB, CurrentI, DT, LI, nullptr);
-          NextBB = ParallelDone;
-          ParallelRegion++;
+            NextBB = handleDoneRegion(ParallelDone, DT, "par.", ParallelItrStr);
+          }
 
+          /// Analyze Outlined Region
           handleParallelOutlinedRegion(CB);
-
-          /// Extract regions and outline them into functions
-          // Function *ParallelFunction = createFunction(DT, ParallelBB);
-          /// For the Done function run the analysis again
-          Function *DoneFunction = createFunction(DT, ParallelDone, true);
-          DoneFunction->setName("parallel.edt.done");
-          /// Get caller of the Done function, and rename BB to par.done
-          CallBase *DoneCB = dyn_cast<CallBase>(DoneFunction->user_back());
-          BasicBlock *DoneBB = DoneCB->getParent();
-          DoneBB->setName(ParallelDoneName);
-          /// Analyze the instructions of the Done function
-          identifyEDTs(*DoneFunction);
         } break;
         case OMPInfo::TASKALLOC: {
           LLVM_DEBUG(dbgs() << TAG << "Task Region Found: " << "\n  "
                             <<  *CB << "\n");
+
           /// Split block at __kmpc_omp_task_alloc
-          auto TaskName = "task.region." + std::to_string(TaskRegion);
-          BasicBlock *TaskBB =
-              SplitBlock(CurrentI->getParent(), CurrentI, DT, LI, nullptr,
-                         TaskName);
-          /// Find the task call
+          auto TaskItrStr = std::to_string(TaskRegion++);
+          auto TaskName = "task.region." + TaskItrStr;
+          BasicBlock *TaskBB;
+          if(CurrentI != &(CurrentBB->front())) {
+            TaskBB = SplitBlock(
+              CurrentI->getParent(), CurrentI, DT, LI, nullptr, TaskName);
+          }
+          else {
+            TaskBB = CurrentBB;
+            TaskBB->setName(TaskName);
+          }
+          /// Find the task call 
           while ((CurrentI = CurrentI->getNextNonDebugInstruction())) {
             auto *TCB = dyn_cast<CallBase>(CurrentI);
             if (TCB && OMPInfo::getRTFunction(TCB->getCalledFunction()) ==
@@ -1180,25 +971,17 @@ struct ARTSAnalyzer {
           /// Remove the task call. We dont need it anymore, and this helps in memory analysis
           auto *NextI = CurrentI->getNextNonDebugInstruction();
           CurrentI->eraseFromParent();
-          /// Split block again at the next instruction
           CurrentI = NextI;
-          auto TaskDoneName =
-              "task.done." + std::to_string(TaskRegion);
-          BasicBlock *TaskDone =
+
+          /// Analyze Done Region
+          if(!isa<ReturnInst>(CurrentI)) {
+            BasicBlock *TaskDone =
               SplitBlock(TaskBB, CurrentI, DT, LI, nullptr);
-          TaskRegion++;
+            NextBB = handleDoneRegion(TaskDone, DT, "task.", TaskItrStr);
+          }
 
+          /// Analyze Outlined Region
           handleTaskOutlinedRegion(CB);
-
-          /// Extract regions and create aux functions
-          /// For the Done function run the analysis again
-          Function *DoneFunction = createFunction(DT, TaskDone, true);
-          DoneFunction->setName("task.edt.done");
-          identifyEDTs(*DoneFunction);
-          CallBase *DoneCB = dyn_cast<CallBase>(DoneFunction->user_back());
-          BasicBlock *DoneBB = DoneCB->getParent();
-          DoneBB->setName(TaskDoneName);
-          NextBB = DoneBB->getNextNode();
         } break;
         case OMPInfo::TASKWAIT: {
           /// \Note A taskwait requires an event.
@@ -1336,7 +1119,7 @@ bool ARTSTransformer::run(FunctionAnalysisManager &FAM) {
   // Changed |= runAttributor(A);
 
   LLVM_DEBUG(dbgs() << TAG << "\nEDTs INFORMATION\n");
-  LLVM_DEBUG(dbgs() << TAG << EDTs << "\n");
+  // LLVM_DEBUG(dbgs() << TAG << EDTs << "\n");
   return Changed;
 }
 
