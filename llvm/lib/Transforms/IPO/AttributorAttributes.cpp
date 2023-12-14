@@ -2031,7 +2031,7 @@ struct AAPointerInfoCallSiteArgument final : AAPointerInfoFloating {
           A.getAAFor<AAPointerInfo>(*this, ArgPos, DepClassTy::REQUIRED);
       if (ArgAA && ArgAA->getState().isValidState())
         return translateAndAddStateFromCallee(A, *ArgAA,
-                                              *cast<CallBase>(getCtxI()));
+                                                 *cast<CallBase>(getCtxI()));
       if (!Arg->getParent()->isDeclaration())
         return indicatePessimisticFixpoint();
     }

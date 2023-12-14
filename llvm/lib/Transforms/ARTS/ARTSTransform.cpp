@@ -2,14 +2,20 @@
 #include "llvm/Transforms/ARTS/ARTSTransform.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
+
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
-#include "llvm/Analysis/CallGraphSCCPass.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
 #include "llvm/Analysis/RegionInfo.h"
+#include "llvm/ADT/SCCIterator.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Frontend/ARTS/ARTSIRBuilder.h"
 
@@ -65,15 +71,13 @@ struct ARTSInformationCache : public InformationCache {
   ARTSInformationCache(Module &M, AnalysisGetter &AG,
                        CallGraphUpdater &CGUpdater, BumpPtrAllocator &Allocator,
                        SetVector<Function *> *Functions, ARTSTransformer &ARTSTransform)
-      : InformationCache(M, AG, Allocator, Functions), AG(AG),
+      : InformationCache(M, AG, Allocator, Functions),
         CGUpdater(CGUpdater), Functions(*Functions), ARTSTransform(ARTSTransform),
         ARTSBuilder(M) {
 
     ARTSBuilder.initialize();
   }
 
-  /// Getters for analysis.
-  AnalysisGetter &AG;
   /// Call Graph
   CallGraphUpdater &CGUpdater;
   /// Module functions
@@ -85,27 +89,25 @@ struct ARTSInformationCache : public InformationCache {
 };
 
 
-/// AAToARTS
-/// This AbstractAttribute analyzes a given function and tries to determine
-/// if it can be transformed to ARTS.
-struct AAToARTS : public StateWrapper<BooleanState, AbstractAttribute> {
+/// EDTAnalyzer
+struct EDTAnalyzer : public StateWrapper<BooleanState, AbstractAttribute> {
   using Base = StateWrapper<BooleanState, AbstractAttribute>;
 
-  AAToARTS(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
+  EDTAnalyzer(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
 
   /// Statistics are tracked as part of manifest for now.
   void trackStatistics() const override {}
 
-  static AAToARTS &createForPosition(const IRPosition &IRP, Attributor &A);
+  static EDTAnalyzer &createForPosition(const IRPosition &IRP, Attributor &A);
 
   /// See AbstractAttribute::getName()
-  const std::string getName() const override { return "AAToARTS"; }
+  const std::string getName() const override { return "EDTAnalyzer"; }
 
   /// See AbstractAttribute::getIdAddr()
   const char *getIdAddr() const override { return &ID; }
 
   /// This function should return true if the type of the \p AA is
-  /// AAToARTS
+  /// EDTAnalyzer
   static bool classof(const AbstractAttribute *AA) {
     return (AA->getIdAddr() == &ID);
   }
@@ -113,142 +115,396 @@ struct AAToARTS : public StateWrapper<BooleanState, AbstractAttribute> {
   static const char ID;
 };
 
-struct AAToARTSFunction : AAToARTS {
-  AAToARTSFunction(const IRPosition &IRP, Attributor &A) : AAToARTS(IRP, A) {}
+struct EDTFunctionAnalyzer : EDTAnalyzer {
+  EDTFunctionAnalyzer(const IRPosition &IRP, Attributor &A) : EDTAnalyzer(IRP, A) {}
 
   /// See AbstractAttribute::getAsStr(Attributor *A)
   const std::string getAsStr(Attributor *A) const override {
     if (!isValidState())
       return "<invalid>";
-    std::string Str("AAToARTSFunction: ");
+    std::string Str("EDTFunctionAnalyzer: ");
     return Str + "OK";
   }
 
   void initialize(Attributor &A) override {
     Function *F = getAnchorScope();
-    LLVM_DEBUG(dbgs() << "\n[AAToARTSFunction] initialize: " << F->getName()
+    LLVM_DEBUG(dbgs() << "\n[EDTFunctionAnalyzer] initialize: " << F->getName()
                       << "\n");
-    // /// Local attributes
-    // AIT = &static_cast<ARTSInformationCache &>(A.getInfoCache());
-    // AT = &AIT->ARTSTransform;
-    // AG = &AIT->AG;
+    /// Local attributes
+    auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
+    auto &AT = ARTSInfoCache.ARTSTransform;
+    EDT = AT.getEdt(F);
+    if(!EDT) {
+      LLVM_DEBUG(dbgs() << "EDTFunctionAnalyzer] EDT not found\n");
+      indicatePessimisticFixpoint();
+      return;
+    }
 
-    // /// Identify
-    // if (!identifyEDTs(*F, A)) {
-    //   indicatePessimisticFixpoint();
-    //   return;
-    // }
-    // LLVM_DEBUG(dbgs() << *F << "\n");
-    /// The rest is handled in the updateImpl function
+    /// Handle the rest on updateImpl...
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
     Function *F = getAnchorScope();
-    LLVM_DEBUG(dbgs() << "[AAToARTSFunction] updateImpl: " << F->getName()
+    LLVM_DEBUG(dbgs() << "[EDTFunctionAnalyzer] updateImpl: " << F->getName()
                       << "\n");
-    // auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
-    // auto &AT = ARTSInfoCache.ARTSTransform;
+    auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
+    auto &AT = ARTSInfoCache.ARTSTransform;
 
-    // /// Iterate through the EDTs to analyze the EDT with empty number of
-    // Blocks LLVM_DEBUG(dbgs() << "\n" << TAG << "EDTs with empty number of
-    // Blocks:\n"); for (auto *EDT : AT.EDTsFromFunction[F]) {
-    //   if (EDT->Blocks.size() != 0)
-    //     continue;
-    //   LLVM_DEBUG(dbgs() << "EDT #" << EDT->ID << "\n");
-    //   auto *EDTInit = EDT->Init;
-    //   assert((EDTInit && EDTInit->HasOMP) && "EDTInit not found");
-    //   auto &OMP = EDTInit->OMP;
-    //   LLVM_DEBUG(dbgs() << "  - OMP: " << OMP.F->getName() << "\n");
+    /// Analyze Memory Locations of the function
+    const auto *MemAA = A.getAAFor<AAMemoryLocation>(
+            *this, IRPosition::function(*F), DepClassTy::OPTIONAL);
 
-    //   /// Add it to the EDTForFunction map
-    //   AT.insertEDTForFunction(OMP.F, EDT);
-    //   /// Run AAToARTS on the EDTInit function
-    //   auto *OMPFAA = A.getAAFor<AAToARTS>(*this,
-    //   IRPosition::function(*OMP.F),
-    //                                       DepClassTy::OPTIONAL);
-    //   if (!OMPFAA->getState().isValidState()) {
-    //     LLVM_DEBUG(dbgs() << "[AAToARTSFunction] OMPFAA is invalid\n");
-    //     indicatePessimisticFixpoint();
-    //     return ChangeStatus::CHANGED;
-    //   }
-    //   if (!OMPFAA->getState().isAtFixpoint()) {
-    //     LLVM_DEBUG(dbgs() << "[AAToARTSFunction] OMPFAA is not at
-    //     fixpoint\n"); return ChangeStatus::UNCHANGED;
-    //   }
-    // }
+    /// Analyze CallInstructions
+    auto CheckForCallSite = [&](AbstractCallSite ACS) {
+      /// For now we are only concerned with calls to EDTs
+      if(!AT.getEdt(ACS.getCalledFunction()))
+        return true;
 
-    // /// If this is the main function
-    // if (F->getName() == "main") {
-    //   LLVM_DEBUG(dbgs() << TAG
-    //                     << "----------- PROCESS HAS FINISHED -----------\n");
-    //   EDTInfo *MainEDT = AT.getEDTForFunction(F);
-    //   assert(MainEDT && "Main EDT not found");
-    //   auto &ARTSBuilder = ARTSInfoCache.ARTSBuilder;
+      /// Run EDTCall
+      const auto *EDAA =  A.getAAFor<EDTAnalyzer>(
+          *this, IRPosition::callsite_function(*ACS.getInstruction()),
+          DepClassTy::OPTIONAL);
 
-    //   LLVM_DEBUG(dbgs() << TAG << "----------- EDTs INFORMATION
-    //   -----------\n"); LLVM_DEBUG(dbgs() << *MainEDT << "\n"); Function
-    //   *MainEDTFunction = ARTSBuilder.createEDT("main.edt");
-    //   MainEDT->setF(MainEDTFunction);
-    //   /// Iterate through the EDT blocks
-    //   for(auto *EB : MainEDT->Blocks) {
-    //     /// Entry and Other blocks are inmmediately added to the main EDT
-    //     Function if(EB->isEntry() || EB->isOther()) {
-    //       ARTSBuilder.insertEDTBlock(EB, MainEDTFunction);
-    //       continue;
-    //     }
-    //     /// If it is an init block, we need to create a new EDT function for
-    //     the
-    //     /// outlined function
-    //     if(EB->isInit()) {
-    //       auto &OMP = EB->OMP;
-    //       assert(OMP.F && "OMP.F not found");
-    //       ARTSBuilder.insertEDTBlock(EB, MainEDTFunction);
-    //       Function *EDTFunction = ARTSBuilder.createEDT(OMP.F->getName());
-    //       /// Is there a init alloca EDT block?
-    //       if(!MainEDT->InitAlloca) {
-    //         // ARTSBuilder.insertEDTBlock(EB->InitAlloca, EDTFunction);
-    //       }
-    //       continue;
-    //     }
-    //   }
+      if (!EDAA || !EDAA->getState().isValidState())
+        return false;
 
-    // }
-    indicateOptimisticFixpoint();
-    return ChangeStatus::CHANGED;
+      return true;
+    };
+    bool AllCallSitesKnown;
+    if (A.checkForAllCallSites(CheckForCallSite, *this,
+                              /* RequiresAllCallSites */ true,
+                              AllCallSitesKnown)) {
+      LLVM_DEBUG(dbgs() << "[EDTFunctionAnalyzer] All CallSites were successfully Initialized\n");
+    }
+
+
+    // indicateOptimisticFixpoint();
+    return ChangeStatus::UNCHANGED;
   }
 
   ChangeStatus manifest(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    LLVM_DEBUG(dbgs() << "[AAToARTSFunction] Manifest\n");
+    LLVM_DEBUG(dbgs() << "[EDTFunctionAnalyzer] Manifest\n");
     return Changed;
   }
+
+  /// Attributes
+  EdtInfo *EDT;
 };
 
-AAToARTS &AAToARTS::createForPosition(const IRPosition &IRP, Attributor &A) {
-  AAToARTS *AA = nullptr;
+struct EDTCallAnalyzer : EDTAnalyzer {
+  EDTCallAnalyzer(const IRPosition &IRP, Attributor &A) : EDTAnalyzer(IRP, A) {}
+
+  /// See AbstractAttribute::getAsStr(Attributor *A)
+  const std::string getAsStr(Attributor *A) const override {
+    if (!isValidState())
+      return "<invalid>";
+    std::string Str("EDTCallAnalyzer: ");
+    return Str + "OK";
+  }
+
+  void initialize(Attributor &A) override {
+    // Function *F = getAnchorScope();
+    CallBase *CB = cast<CallBase>(&getAssociatedValue());
+    LLVM_DEBUG(dbgs() << "\n[EDTCallAnalyzer] initialize: " << *CB << "\n");
+
+    auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
+    auto &AT = ARTSInfoCache.ARTSTransform;
+    EDT = AT.getEdt(CB);
+    assert(EDT && "EDT not found");
+
+    /// For now we are only concerned with shared variables
+    if(!EDT->hasSharedVars()) {
+      LLVM_DEBUG(dbgs() << "[EDTCallAnalyzer] EDT does not have shared variables\n");
+      indicateOptimisticFixpoint();
+    }
+
+    /// Handle the rest on updateImpl...
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    CallBase *CB = cast<CallBase>(&getAssociatedValue());
+    LLVM_DEBUG(dbgs() << "\n[EDTCallAnalyzer] updateImpl: " << *CB << "\n");
+
+    auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
+    auto &AT = ARTSInfoCache.ARTSTransform;
+    /// Analyze CallInstruction to get the shared variables (pointers)
+    for(auto &Arg : CB->data_ops()) {
+      if(!isa<PointerType>(Arg->getType()))
+        continue;
+      const auto *EDAA =  A.getAAFor<EDTAnalyzer>(
+          *this, IRPosition::callsite_argument(*CB, Arg.getOperandNo()),
+          DepClassTy::OPTIONAL);
+      if(!EDAA || !EDAA->getState().isValidState())
+        continue;
+    }
+   
+    return ChangeStatus::UNCHANGED;
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    LLVM_DEBUG(dbgs() << "[EDTCallAnalyzer] Manifest\n");
+    return Changed;
+  }
+
+  /// Attributes
+  EdtInfo *EDT;
+};
+
+struct EDTArgAnalyzer : EDTAnalyzer {
+  EDTArgAnalyzer(const IRPosition &IRP, Attributor &A) : EDTAnalyzer(IRP, A) {}
+
+  /// See AbstractAttribute::getAsStr(Attributor *A)
+  const std::string getAsStr(Attributor *A) const override {
+    if (!isValidState())
+      return "<invalid>";
+    std::string Str("EDTArgAnalyzer: ");
+    return Str + "OK";
+  }
+
+  void initialize(Attributor &A) override {
+    Value *Arg = &getAssociatedValue();
+    const CallBase *Call = dyn_cast<CallBase>(&getAnchorValue());
+
+    int ArgNum = getCallSiteArgNo();
+    LLVM_DEBUG(dbgs() << "\n[EDTArgAnalyzer] initialize: " << *Arg 
+                      << " - " << ArgNum << " in: " << *Call << "\n");
+
+    /// Handle the rest on updateImpl...
+  }
+
+  bool analyzeDep(ARTSTransformer &AT, CallBase *CBFrom, CallBase *CBTo, Value *ValToSignal) {
+    /// Given an EDTCall 'CBFrom' and 'CBTo', it analyzes if there is a dependency
+    /// between them.
+    LLVM_DEBUG(dbgs() << "[EDTDepAnalyzer] Analyzing dependencies...\n");
+
+    if(CBFrom == CBTo) {
+      LLVM_DEBUG(dbgs() << "   - Same CallBase\n");
+      return false;
+    }
+
+    /// We are only concerned with calls to EDTs
+    EdtInfo *EdtFrom = AT.getEdt(CBFrom);
+    // LLVM_DEBUG(dbgs() << *EdtFrom << "\n");
+    EdtInfo *EdtTo = AT.getEdt(CBTo);
+    if(!EdtFrom || !EdtTo) {
+      LLVM_DEBUG(dbgs() << "   - CallBase is not an EDT\n");
+      return false;
+    }
+
+    switch(EdtFrom->getType()){
+      case EdtInfo::PARALLEL: {
+        LLVM_DEBUG(dbgs() << "   - This is a ParallelEDT.\n");
+        /// Get the successor EDT
+        BasicBlock *SuccBB = CBFrom->getParent()->getSingleSuccessor();
+        assert(SuccBB && "There should be only one successor");
+        CallBase *EdtCall = AT.getEdtCall(SuccBB);
+        if(!EdtCall) {
+          LLVM_DEBUG(dbgs() << "   - There is no successor EDT\n");
+          return false;
+        }
+        LLVM_DEBUG(dbgs() << "    - Succ: " << *EdtCall << "\n");
+        EdtInfo *SuccEdt = AT.getEdt(EdtCall);
+        assert(SuccEdt && "Successor EDT not found");
+        /// 
+        if(EdtTo == SuccEdt) {
+          LLVM_DEBUG(dbgs() << "   - There is a Data dependency\n");
+          EdtFrom->insertDep(EdtTo, ValToSignal);
+          return true;
+        }
+      
+        /// Analyze call arguments t
+        /// Analyze shared variables of CalleeEdt
+        // for(auto &Shared : CalleeEdt->DE.Shareds) {
+        //   /// If the shared variable is not in the successor EDT, add it
+        //   if(!SuccEdt->DE.Shareds.count(Shared)) {
+        //     SuccEdt->DE.Shareds.insert(Shared);
+        //     LLVM_DEBUG(dbgs() << "   - Adding shared variable: " << *Shared << "\n");
+        //   }
+        // }
+        
+        
+      } break;
+      case EdtInfo::TASK: {
+        // /// Get the successor EDT
+        // EdtInfo *SuccEdt = CalleeEdt->Successors[0];
+        // LLVM_DEBUG(dbgs() << "    - Succ: " << SuccEdt->F->getName() << "\n");
+        // /// Add dependency
+        // CallerEdt->Successors.push_back(SuccEdt);
+        // SuccEdt->Predecessors.push_back(CallerEdt);
+      } break;
+      case EdtInfo::OTHER: {
+        // /// Get the successor EDT
+        // EdtInfo *SuccEdt = CalleeEdt->Successors[0];
+        // LLVM_DEBUG(dbgs() << "    - Succ: " << SuccEdt->F->getName() << "\n");
+        // /// Add dependency
+        // CallerEdt->Successors.push_back(SuccEdt);
+        // SuccEdt->Predecessors.push_back(CallerEdt);
+      } break;
+      default:
+        break;
+    }
+    LLVM_DEBUG(dbgs() << "   - There is no dependency\n");
+    return false;
+  }
+
+  bool analyzePI(Attributor &A, const AAPointerInfo &PI, CallBase *CBFrom, Value *ValToSignal) {
+    /// Analyze pointer info result to determine if the an EDT 'A' has to signal
+    /// a value to another EDT 'B'.
+
+    /// We are only interested in valid states
+    if(!PI.getState().isValidState()) {
+      LLVM_DEBUG(dbgs() << "[EDTArgAnalyzer][AnalyzePI] PI is invalid\n");
+      indicatePessimisticFixpoint();
+      return false;
+    }
+
+    /// Check if it is fixed. This is not really necessary. Even if it not fixed,
+    /// we can still determine if there is a dependency or not. For now, we just
+    /// return false.
+    if(!PI.getState().isAtFixpoint())
+      return false;
+
+    bool HasDependency = false;
+    /// Analyzes the access for each offset bin.
+    auto &ARTSInfoCache = static_cast<ARTSInformationCache &>(A.getInfoCache());
+    auto &AT = ARTSInfoCache.ARTSTransform;
+    const std::function<bool(const AA::RangeTy &, const SmallSet<unsigned, 4> &,
+                             const AAPointerInfo *AAPI)> AccessCB = 
+    [&](const AA::RangeTy &Range, const SmallSet<unsigned, 4> &AccIndex,
+        const AAPointerInfo *AAPI) {
+      LLVM_DEBUG(dbgs() << "[" << Range.Offset << "-" << Range.Offset + Range.Size
+                        << "] : " << AccIndex.size() << "\n");
+      for (auto AI : AccIndex) {
+        auto &Acc = PI.getAccess(AI);
+        Instruction *LocalInst = Acc.getLocalInst();
+        LLVM_DEBUG(dbgs() << "     - " << Acc.getKind() << " - " << *LocalInst << "\n");
+
+        /// Analyze dependencies on Callbase
+        if(auto *CBTo = dyn_cast<CallBase>(LocalInst)) {
+          if(analyzeDep(AT, CBFrom, CBTo, ValToSignal)) {
+            LLVM_DEBUG(dbgs() << "   - There is a dependency\n");
+            HasDependency = true;
+            /// We don't need to analyze the rest of the accesses
+            return false;
+          }
+        }
+        /// Debug output
+        if (Acc.getLocalInst() != Acc.getRemoteInst())
+          LLVM_DEBUG(dbgs() << "     -->RM:                         " << *Acc.getRemoteInst()
+                            << "\n");
+        if (!Acc.isWrittenValueYetUndetermined()) {
+          if (isa_and_nonnull<Function>(Acc.getWrittenValue()))
+            LLVM_DEBUG(dbgs() << "       - c: func " << Acc.getWrittenValue()->getName()
+                              << "\n");
+          else if (Acc.getWrittenValue())
+            LLVM_DEBUG(dbgs() << "       - c: " << *Acc.getWrittenValue() << "\n");
+          else
+            LLVM_DEBUG(dbgs() << "       - c: <unknown>\n");
+        }
+      }
+      return true;
+    };
+
+    if(!PI.forallOffsetBins(AccessCB) && HasDependency) {
+      indicateOptimisticFixpoint();
+      return true;
+    }
+    indicatePessimisticFixpoint();
+    return false;
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    Value *Arg = &getAssociatedValue();
+    CallBase *Call = dyn_cast<CallBase>(&getAnchorValue());
+    
+    LLVM_DEBUG(dbgs() << "\n[EDTArgAnalyzer] updateImpl: " << *Arg
+                      << " in: " << *Call << "\n");
+
+    /// For all the underlying objects of the pointer/argument (including phi
+    /// instructions), check if they are used in a call to an EDT through a
+    /// PointerInfo analysis.
+    auto Pred = [&](Value &Obj) {
+      LLVM_DEBUG(dbgs() << "Visit underlying object " << Obj << "\n");
+      if (isa<UndefValue>(&Obj))
+        return true;
+
+      auto *ArgAA =
+        A.getAAFor<AAPointerInfo>(*this, IRPosition::value(Obj), DepClassTy::OPTIONAL);
+
+      /// Analyze pointer info. This may return false, but we ignore it for now.
+      analyzePI(A, *ArgAA, Call, Arg);
+      return true;
+    };
+
+    const auto *AAUO = A.getAAFor<AAUnderlyingObjects>(
+      *this, IRPosition::value(*Arg), DepClassTy::OPTIONAL);
+    if (!AAUO || !AAUO->forallUnderlyingObjects(Pred)) {
+      LLVM_DEBUG(
+          dbgs() << "Underlying objects stored into could not be determined\n");
+      indicatePessimisticFixpoint();
+    }
+
+    
+    // auto *ArgPVAA =
+    //   A.getAAFor<AAPotentialValues>(*this, IRPosition::value(*Arg), DepClassTy::OPTIONAL);
+    // if (ArgPVAA && ArgPVAA->getState().isValidState())
+    //   LLVM_DEBUG(dbgs() << "  - AAPotentialValues: " << ArgPVAA->getState() << "\n");
+    /// Analyze CallInstruction to get the shared variables (pointers)
+    // for(auto &Arg : CB->data_ops()) {
+    //   if(!isa<PointerType>(Arg->getType()))
+    //     continue;
+    //   /// Get the shared variable
+    //   const auto *EDAA =  A.getAAFor<EDTAnalyzer>(
+    //       *this, IRPosition::callsite_argument(*CB, Arg.getOperandNo()),
+    //       DepClassTy::OPTIONAL);
+    //   if(!EDAA || !EDAA->getState().isValidState())
+    //     continue;
+    // }
+   
+    return ChangeStatus::UNCHANGED;
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    LLVM_DEBUG(dbgs() << "[EDTArgAnalyzer] Manifest\n");
+    return Changed;
+  }
+
+};
+
+EDTAnalyzer &EDTAnalyzer::createForPosition(const IRPosition &IRP, Attributor &A) {
+  EDTAnalyzer *AA = nullptr;
   switch (IRP.getPositionKind()) {
   case IRPosition::IRP_INVALID:
   case IRPosition::IRP_ARGUMENT:
-  case IRPosition::IRP_CALL_SITE_ARGUMENT:
   case IRPosition::IRP_RETURNED:
   case IRPosition::IRP_CALL_SITE_RETURNED:
-  case IRPosition::IRP_CALL_SITE:
   case IRPosition::IRP_FLOAT:
     llvm_unreachable(
-        "AAToARTS can only be created for function/float position!");
+        "EDTAnalyzer can only be created for function position!");
     break;
   case IRPosition::IRP_FUNCTION:
-    AA = new (A.Allocator) AAToARTSFunction(IRP, A);
+    AA = new (A.Allocator) EDTFunctionAnalyzer(IRP, A);
+    break;
+  case IRPosition::IRP_CALL_SITE:
+    AA = new (A.Allocator) EDTCallAnalyzer(IRP, A);
+    break;
+  case IRPosition::IRP_CALL_SITE_ARGUMENT:
+    AA = new (A.Allocator) EDTArgAnalyzer(IRP, A);
     break;
   }
   return *AA;
 }
 
-const char AAToARTS::ID = 0;
+const char EDTAnalyzer::ID = 0;
 
 struct ARTSAnalyzer {
-  ARTSAnalyzer(ARTSTransformer &AT, FunctionAnalysisManager &FAM, AnalysisGetter &AG)
-      : AT(AT), FAM(FAM), AG(AG) {}
+  ARTSAnalyzer(ARTSTransformer &AT, ModuleAnalysisManager &AM)
+      : AT(AT), AM(AM),
+        FAM(AM.getResult<FunctionAnalysisManagerModuleProxy>(AT.M).getManager()),
+        AG(FAM) {}
 
   //// Region functions
   void visitRegion(Region &R) {
@@ -323,9 +579,25 @@ struct ARTSAnalyzer {
     }
   }
 
+  void getDominatedCalls(CallBase *CB, DominatorTree *DT, 
+                         SmallSetVector<CallBase *, 16> &Calls) {
+    /// Get BB of the call
+    BasicBlock *BB = CB->getParent();
+    BlockSequence DominatedBBs;
+    getDominatedBBs(BB, *DT, DominatedBBs);
+    /// Get calls in dominated BBs
+    for(auto *DominatedBB : DominatedBBs) {
+      for(auto &I : *DominatedBB) {
+        if(auto *CB = dyn_cast<CallBase>(&I)) {
+          Calls.insert(CB);
+        }
+      }
+    }
+  }
+  
   /// Remove values interface
-  void removeValue(Value *V, bool RecursiveRemove = false, bool RecursiveUndef = true, 
-                   Instruction *Exclude = nullptr) {
+  void removeValue(Value *V, bool RecursiveRemove = false,
+                   bool RecursiveUndef = true,  Instruction *Exclude = nullptr) {
     if (isa<UndefValue>(V) || V == Exclude)
       return;
     /// Instructions
@@ -421,8 +693,8 @@ struct ARTSAnalyzer {
   /// the instructions of the BB. The function is then inserted to the
   /// module.
   Function *
-  createFunction(DominatorTree *DT, BasicBlock *FromBB, bool DTAnalysis = false,
-                 std::string FunctionName = "",
+  createFunction(DominatorTree *DT, BasicBlock *FromBB,
+                 bool DTAnalysis = false, std::string FunctionName = "",
                  SmallVector<Value *, 0> *ExcludeArgsFromAggregate = nullptr) {
     Function &F = *FromBB->getParent();
     AssumptionCache *AC = AG.getAnalysis<AssumptionAnalysis>(F, true);
@@ -501,7 +773,7 @@ struct ARTSAnalyzer {
 
     // Create Parallel EDT
     EdtInfo &ParallelEDT = *AT.insertEdt(EdtInfo::PARALLEL, NewFn);
-
+  
     // Since we have now created the new function, splice the body of the old
     // function right into the new function, leaving the old rotting hulk of the
     // function empty.
@@ -512,21 +784,28 @@ struct ARTSAnalyzer {
     const AttributeList &OldCallAttributeList = OldCB->getAttributes();
     SmallVector<Value *, 16> NewArgOperands;
     SmallVector<AttributeSet, 16> NewArgOperandAttributes;
+    
     for (unsigned OldArgNum = KeepCallArgsFrom;
          OldArgNum < OldCB->data_operands_size(); ++OldArgNum) {
-      NewArgOperands.push_back(OldCB->getArgOperand(OldArgNum));
+      auto *Arg = OldCB->getArgOperand(OldArgNum);
+      NewArgOperands.push_back(Arg);
       NewArgOperandAttributes.push_back(
           OldCallAttributeList.getParamAttrs(OldArgNum));
+      /// Map Value (Shared) with list of EDTs that use it
+      // if (PointerType *PT = dyn_cast<PointerType>(Arg->getType()))
+      //   AT.insertValueToEdt(Arg, &ParallelEDT);
     }
 
     // Create a new call or invoke instruction to replace the old one.
     auto *NewCI =
         CallInst::Create(NewFn, NewArgOperands, std::nullopt, "", OldCB);
     NewCI->setTailCallKind(cast<CallInst>(OldCB)->getTailCallKind());
+    // AT.insertEdtforBlock(&ParallelEDT, NewCI->getParent());
 
     // Copy over various properties and the new attributes.
     LLVMContext &Ctx = OldFn->getContext();
     CallBase *NewCB = NewCI;
+    AT.insertEdtCall(NewCB);
     NewCB->setCallingConv(OldCB->getCallingConv());
     NewCB->takeName(OldCB);
     NewCB->setAttributes(AttributeList::get(
@@ -541,7 +820,7 @@ struct ARTSAnalyzer {
       NewFnArgIt->takeName(&*OldFnArgIt);
       OldFnArgIt->replaceAllUsesWith(&*NewFnArgIt);
       /// Add to Parallel EDT Data Environment
-      Argument *Arg = &*OldFnArgIt;
+      Argument *Arg = &*NewFnArgIt;
       Type *ArgType = NewFnArgIt->getType();
       /// For now assume that if it is a pointer, it is a shared variable
       if (PointerType *PT = dyn_cast<PointerType>(ArgType))
@@ -566,6 +845,7 @@ struct ARTSAnalyzer {
 
     assert(NewFn->isDeclaration() == false && "New function is a declaration");
     LLVM_DEBUG(dbgs() << " - New CB: " << *NewCB << "\n");
+    LLVM_DEBUG(dbgs() << ParallelEDT.DE << "\n");
 
     /// Identify EDT for new function
     if(!identifyEDTs(*NewFn))
@@ -734,12 +1014,17 @@ struct ARTSAnalyzer {
     /// Generate CallInst to NewFn
     SmallVector<Value *, 0> NewCallArgs;
     for (auto TDItr : ValueToOffsetTD) {
-      NewCallArgs.push_back(TDItr.first);
+      auto *Arg = TDItr.first;
+      NewCallArgs.push_back(Arg);
+      /// Map Value (Shared) with list of EDTs that use it
+      // if (PointerType *PT = dyn_cast<PointerType>(Arg->getType()))
+      //   AT.insertValueToEdt(Arg, &TaskEdt);
     }
 
     auto *LastInstruction = BB->getTerminator();
     auto *NewCI =
         CallInst::Create(NewFn, NewCallArgs, std::nullopt, "", LastInstruction);
+    AT.insertEdtCall(NewCI);
     NewCI->setTailCallKind(cast<CallInst>(CB)->getTailCallKind());
     LLVM_DEBUG(dbgs() << " - New CB: " << *NewCI << "\n");
     LLVM_DEBUG(dbgs() << TaskEdt.DE << "\n");
@@ -770,23 +1055,6 @@ struct ARTSAnalyzer {
     LLVM_DEBUG(dbgs() << "\n" <<  TAG << "Handling done region\n");
     /// Get first instruction of BB to analyze if we need a new function
     Instruction *FirstI = &*DoneBB->begin();
-
-    /// If the BB only has a return instruction, we can just remove it, and
-    /// add the return instruction to the predecessor
-    // if (isa<ReturnInst>(FirstI)) {
-    //   LLVM_DEBUG(dbgs() << TAG << " - Removing return instruction\n");
-    //   /// Get predecessor and add return void
-    //   BasicBlock *PredBB = DoneBB->getUniquePredecessor();
-    //   assert(PredBB && "Expected only one predecessor");
-    //   auto *PredBBTerminator = PredBB->getTerminator();
-    //   IRBuilder<> Builder(PredBBTerminator);
-    //   Builder.CreateRetVoid();
-    //   /// Remove BB
-    //   PredBBTerminator->eraseFromParent();
-    //   DoneBB->eraseFromParent();
-    //   return PredBB;
-    // }
-
     /// If it is a callbase, check if its a call to a RT function
     if(auto *CB = dyn_cast<CallBase>(FirstI)) {
       if(OMPInfo::isRTFunction(*CB))
@@ -797,17 +1065,25 @@ struct ARTSAnalyzer {
     /// Handle other instructions
     auto DoneFnName = PrefixName + "edt.done";
     Function *DoneFunction = createFunction(DT, DoneBB, true, DoneFnName);
-    // LLVM_DEBUG(dbgs() << "Done Function: " << *DoneFunction << "\n");
+    EdtInfo *DoneEDT = AT.insertEdt(EdtInfo::OTHER, DoneFunction);
+
     /// Analyze Data Environment
-    BlockSequence DoneRegion;
-    for (auto &BB : *DoneFunction)
-      DoneRegion.push_back(&BB);
-    SetVector<Value *> Inputs, Outputs, Sinks;
-    getInputsOutputs(DoneRegion, DT, Inputs, Outputs, Sinks);
+    /// The function arguments provide this information.
+    for (auto &Arg : DoneFunction->args()) {
+      Type *ArgType = Arg.getType();
+      /// For now assume that if it is a pointer, it is a shared variable
+      if (PointerType *PT = dyn_cast<PointerType>(ArgType))
+        AT.insertArgToDE(&Arg, DataEnv::SHARED, *DoneEDT);
+      /// If not, it is a first private variable
+      else
+        AT.insertArgToDE(&Arg, DataEnv::FIRSTPRIVATE, *DoneEDT);
+    }
+    LLVM_DEBUG(dbgs() << DoneEDT->DE << "\n");
 
     /// Get caller of the Done function, and rename BB to par.done
     auto DoneBBName = PrefixName + "done." + SuffixBB;
     CallBase *DoneCB = dyn_cast<CallBase>(DoneFunction->user_back());
+    AT.insertEdtCall(DoneCB);
     auto *NewDoneBB = DoneCB->getParent();
     NewDoneBB->setName(DoneBBName);
 
@@ -893,7 +1169,7 @@ struct ARTSAnalyzer {
     uint32_t ParallelRegion = 0;
     uint32_t TaskRegion = 0;
     LLVM_DEBUG(dbgs() << "\n");
-    LLVM_DEBUG(dbgs() << TAG << "[identifyEDTs] Identifying EDT regions for: " << F.getName() << "\n");
+    LLVM_DEBUG(dbgs() << TAG << "[identifyEDTs] Identifying EDTs for: " << F.getName() << "\n");
 
     /// If function is not IPO amendable, we give up
     if (F.isDeclaration() && !F.hasLocalLinkage())
@@ -963,8 +1239,7 @@ struct ARTSAnalyzer {
           /// Find the task call 
           while ((CurrentI = CurrentI->getNextNonDebugInstruction())) {
             auto *TCB = dyn_cast<CallBase>(CurrentI);
-            if (TCB && OMPInfo::getRTFunction(TCB->getCalledFunction()) ==
-                            OMPInfo::TASK)
+            if (TCB && OMPInfo::getRTFunction(*TCB) == OMPInfo::TASK)
               break;
           }
           assert(CurrentI && "Task RT call not found");
@@ -973,11 +1248,12 @@ struct ARTSAnalyzer {
           CurrentI->eraseFromParent();
           CurrentI = NextI;
 
-          /// Analyze Done Region
+          /// Task are asynchronous. So no need to handle "Done region"
           if(!isa<ReturnInst>(CurrentI)) {
             BasicBlock *TaskDone =
               SplitBlock(TaskBB, CurrentI, DT, LI, nullptr);
-            NextBB = handleDoneRegion(TaskDone, DT, "task.", TaskItrStr);
+            // NextBB = handleDoneRegion(TaskDone, DT, "task.", TaskItrStr);
+            NextBB = TaskDone;
           }
 
           /// Analyze Outlined Region
@@ -1019,51 +1295,254 @@ struct ARTSAnalyzer {
     return false;
   }
 
+  /// Analyze EDTs
+  void analyzeDeps() {
+    /// This function analyzes de EDT and finds dependencies between them.
+    /// Here it is very important to consider the nature of certain regions:
+    /// - Parallel regions: They are executed in parallel, and there is a
+    ///   barrier at the end of the region. This means that every change 
+    ///   performed in the region is visible after the region.
+    /// - Task regions: They are asynchronous. This is means there is no
+    ///   guarantee that the changes performed in the region are visible
+    ///   after the region. This is because the task may not be executed
+    ///   immediately.
+  
+    /// Analyze callgraph
+    LLVM_DEBUG(dbgs() << TAG << "Analyzing EDTs\n");
+    /// Iterate through all the functions that represents an EDT
+    
+    CallGraph &CG = AM.getResult<CallGraphAnalysis>(AT.M);
+    LoopInfo *LI = nullptr;
+    // // CG.dump();
+
+    // LLVM_DEBUG(dbgs() << "\n---------------------------------\n");
+    for(auto &CGItr : CG) {
+      const Function *F = CGItr.first;
+      /// Skip external functions
+      if (!F || !F->isDefinitionExact())
+        continue;
+
+      /// Get the Caller EDT -> EDT representing F that calls other EDTs
+      EdtInfo *CallerEdt = AT.getEdt(const_cast<Function*>(F));
+      if(!CallerEdt)
+        continue;
+      LLVM_DEBUG(dbgs() << TAG << "EDT: " << F->getName() << "\n");
+
+      /// Analyze Callees
+      CallGraphNode *CGN = CGItr.second.get();
+      for(CallGraphNode::CallRecord &Edge : *CGN) {
+        if (!Edge.first)
+          continue;
+
+        /// We are only concerned with calls to EDTs
+        CallBase *CB = cast<CallBase>(*Edge.first);
+        Function *CalleeFn = CB->getCalledFunction();
+        EdtInfo *CalleeEdt = AT.getEdt(CalleeFn);
+        if(!CalleeEdt)
+          continue;
+        LLVM_DEBUG(dbgs() << "  - Callee: " << CalleeFn->getName() << "\n");
+
+        /// For now, we are only concerned with Parallel EDTs
+        // if(CalleeEdt->getType() != EdtInfo::PARALLEL)
+        //   continue;
+
+        /// If CB is in a loop, continue
+        // Loop *L = LI->getLoopFor(CB->getParent());
+
+        /// If Callee EDT is a parallel region, we are only concerned with the successor
+        /// EDT. (Note: There should be only one successor)
+
+        /// Get the successor BasicBlock
+        BasicBlock *CBParent = CB->getParent();
+  
+        /// Assert that there is only one successor
+        
+
+
+        switch(CalleeEdt->getType()){
+          case EdtInfo::PARALLEL: {
+            LLVM_DEBUG(dbgs() << "   - This is a ParallelEDT. Analyzing ParalllelEDT Done \n");
+            /// Get the successor EDT
+            BasicBlock *SuccBB = CBParent->getSingleSuccessor();
+            assert(SuccBB && "There should be only one successor");
+            CallBase *EdtCall = AT.getEdtCall(SuccBB);
+            EdtInfo *SuccEdt = AT.getEdt(EdtCall);
+            assert(SuccEdt && "Successor EDT not found");
+            /// Analyze call arguments t
+            /// Analyze shared variables of CalleeEdt
+            // for(auto &Shared : CalleeEdt->DE.Shareds) {
+            //   /// If the shared variable is not in the successor EDT, add it
+            //   if(!SuccEdt->DE.Shareds.count(Shared)) {
+            //     SuccEdt->DE.Shareds.insert(Shared);
+            //     LLVM_DEBUG(dbgs() << "   - Adding shared variable: " << *Shared << "\n");
+            //   }
+            // }
+            
+            
+          } break;
+          case EdtInfo::TASK: {
+            // /// Get the successor EDT
+            // EdtInfo *SuccEdt = CalleeEdt->Successors[0];
+            // LLVM_DEBUG(dbgs() << "    - Succ: " << SuccEdt->F->getName() << "\n");
+            // /// Add dependency
+            // CallerEdt->Successors.push_back(SuccEdt);
+            // SuccEdt->Predecessors.push_back(CallerEdt);
+          } break;
+          case EdtInfo::OTHER: {
+            // /// Get the successor EDT
+            // EdtInfo *SuccEdt = CalleeEdt->Successors[0];
+            // LLVM_DEBUG(dbgs() << "    - Succ: " << SuccEdt->F->getName() << "\n");
+            // /// Add dependency
+            // CallerEdt->Successors.push_back(SuccEdt);
+            // SuccEdt->Predecessors.push_back(CallerEdt);
+          } break;
+          default:
+            break;
+        }
+        /// Get the successor EDT
+        // EdtInfo *SuccEdt = nullptr;
+        // if(CalleeEdt->Type == EdtInfo::PARALLEL) {
+        //   SuccEdt = CalleeEdt->Successors[0];
+        //   LLVM_DEBUG(dbgs() << "    - Succ: " << SuccEdt->F->getName() << "\n");
+        // }
+
+      }
+    }
+
+  //   DominatorTree *DT = AG.getAnalysis<DominatorTreeAnalysis>(*F);
+  //   // auto &MSSA = AG.getAnalysis<MemorySSAAnalysis>(*F, false)->getMSSA();
+  //   auto *MD = AG.getAnalysis<MemoryDependenceAnalysis>(*F);
+  // // MemorySSA &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
+  //   LLVM_DEBUG(dbgs()<<*F<<"\n");
+  //   // MSSA.dump();
+
+    
+
+  //     /// Iterate through the arguments of the call
+  //     for(uint32_t ArgItr = 0; ArgItr < CB->data_operands_size(); ArgItr++) {
+  //       Value *Arg = CB->getArgOperand(ArgItr);
+  //       LLVM_DEBUG(dbgs() << "     -- Arg: " << *Arg << "\n");
+  //       /// We are only concerned with instructions
+  //       Instruction *ArgInst = dyn_cast<Instruction>(Arg);
+  //       if(!ArgInst)
+  //         continue;
+  //       /// Is used after the BB?
+  //       if(!ArgInst->isUsedOutsideOfBlock(ArgInst->getParent()))
+  //         continue;
+  //       LLVM_DEBUG(dbgs() << "     -- It is used outside the BB\n");
+  //       /// Get Dep
+  //       MemDepResult Dep = MD->getDependency(ArgInst);
+  //       if(Dep.getInst())
+  //         LLVM_DEBUG(dbgs() << "     -- Dep: " << *Dep.getInst() << "\n");
+  //       // const MemoryDependenceResults::NonLocalDepInfo &Deps = MD->getNonLocalPointerDependency(Arg, CB->getParent());
+  //       // for (const NonLocalDepEntry &I : Deps) {
+  //         // LLVM_DEBUG(dbgs() << "     -- NonLocalDepBB: " << I.getBB()->getName() << "\n");
+  //       // }
+  //     }
+
+  //     // MD->getDependency(CB);
+  //     // MemDepResult Dep = MD->getDependency(CB);
+  //     // Instruction *DepInst = Dep.getInst();
+  //     // if(!DepInst)
+  //     //   continue;
+  //     // LLVM_DEBUG(dbgs() << "     -- Dep: " << *DepInst << "\n");
+  
+  //     // // Non-local case.
+  //     // const MemoryDependenceResults::NonLocalDepInfo &deps =
+  //     //   MD->getNonLocalCallDependency(CB);
+  //     // // FIXME: Move the checking logic to MemDep!
+  //     // CallInst* cdep = nullptr;
+  //     // // Check to see if we have a single dominating call instruction that is
+  //     // // identical to C.
+  //     // for (const NonLocalDepEntry &I : deps) {
+  //     //   LLVM_DEBUG(dbgs() << "     -- NonLocalDepBB: " << I.getBB()->getName() << "\n");
+  //     //   // LLVM_DEBUG(dbgs() << "     -- NonLocalDepEntry: " << *I.getResult().getInst() << "\n");
+  //     //   // if (I.getResult().isNonLocal())
+  //     //   //   continue;
+
+  //     //   // // We don't handle non-definitions.  If we already have a call, reject
+  //     //   // // instruction dependencies.
+  //     //   // if (!I.getResult().isDef() || cdep != nullptr) {
+  //     //   //   cdep = nullptr;
+  //     //   //   break;
+  //     //   // }
+
+  //     //   // CallInst *NonLocalDepCall = dyn_cast<CallInst>(I.getResult().getInst());
+  //     //   // // FIXME: All duplicated with non-local case.
+  //     //   // if (NonLocalDepCall && DT->properlyDominates(I.getBB(), C->getParent())) {
+  //     //   //   cdep = NonLocalDepCall;
+  //     //   //   continue;
+  //     //   // }
+
+  //     //   // cdep = nullptr;
+  //     //   // break;
+  //     // }
+
+  //   }
+
+  //   // }
+  // }
+
+  // LLVM_DEBUG(dbgs() << "\n---------------------------------\n");
+  // We do a bottom-up SCC traversal of the call graph.  In other words, we
+  // visit all callees before callers (leaf-first).
+  // for (scc_iterator<CallGraph *> I = scc_begin(&CG); !I.isAtEnd(); ++I) {
+  //   const std::vector<CallGraphNode *> &SCC = *I;
+  //   assert(!SCC.empty() && "SCC with no functions?");
+
+  //   // Skip external node SCCs.
+  //   Function *F = SCC[0]->getFunction();
+  //   if (!F || !F->isDefinitionExact())
+  //     continue;
+  //   /// Get corresponding EDT
+  //   EdtInfo *EdtInfo = AT.getEdt(F);
+  //   if(!EdtInfo)
+  //     continue;
+
+
+  //   /// Debug SCC
+  //   LLVM_DEBUG(dbgs() << TAG << "SCC: \n");
+  //   /// Called Functions
+  //   LLVM_DEBUG(for (CallGraphNode *CGN : SCC) {
+  //     // CGN->getFunction()
+  //     // if (!SCCI.hasCycle()) // We only care about cycles, not standalone nodes.
+  //     // continue;
+  //     dbgs() << TAG << "  - " << CGN->getFunction()->getName() << "\n";
+  //     /// DEBUG CGN
+  //     CGN->dump();
+      
+  //   });
+  // }
+    /// Analyze EDTs
+    // for(auto Itr : AT.`orFunction) {
+      // auto *F = Itr.first;
+      // auto &EdtInfo = Itr.second;
+      // /// Analyze Data Environment
+      // for (auto &Arg : F->args()) {
+      //   Type *ArgType = Arg.getType();
+      //   /// For now assume that if it is a pointer, it is a shared variable
+      //   if (PointerType *PT = dyn_cast<PointerType>(ArgType))
+      //     AT.insertArgToDE(&Arg, DataEnv::SHARED, EdtInfo);
+      //   /// If not, it is a first private variable
+      //   else
+      //     AT.insertArgToDE(&Arg, DataEnv::FIRSTPRIVATE, EdtInfo);
+      // }
+      // LLVM_DEBUG(dbgs() << EdtInfo.DE << "\n");
+    // }
+  }
+
   /// Attributes
   ARTSTransformer &AT;
+  ModuleAnalysisManager &AM;
   FunctionAnalysisManager &FAM;
-  AnalysisGetter &AG;
+  AnalysisGetter AG;
   /// Set of Values to remove
   SmallVector<Value *, 16> ValuesToRemove;
 };
 
 
-void registerAAsForFunction(Attributor &A, const Function &F) {
-  if (F.hasFnAttribute(Attribute::Convergent))
-    A.getOrCreateAAFor<AANonConvergent>(IRPosition::function(F));
-
-  for (auto &I : instructions(F)) {
-    if (auto *LI = dyn_cast<LoadInst>(&I)) {
-      bool UsedAssumedInformation = false;
-      A.getAssumedSimplified(IRPosition::value(*LI), /* AA */ nullptr,
-                             UsedAssumedInformation, AA::Interprocedural);
-      continue;
-    }
-    if (auto *CI = dyn_cast<CallBase>(&I)) {
-      if (CI->isIndirectCall())
-        A.getOrCreateAAFor<AAIndirectCallInfo>(
-            IRPosition::callsite_function(*CI));
-    }
-    if (auto *SI = dyn_cast<StoreInst>(&I)) {
-      A.getOrCreateAAFor<AAIsDead>(IRPosition::value(*SI));
-      continue;
-    }
-    if (auto *FI = dyn_cast<FenceInst>(&I)) {
-      A.getOrCreateAAFor<AAIsDead>(IRPosition::value(*FI));
-      continue;
-    }
-    if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
-      if (II->getIntrinsicID() == Intrinsic::assume) {
-        A.getOrCreateAAFor<AAPotentialValues>(
-            IRPosition::value(*II->getArgOperand(0)));
-        continue;
-      }
-    }
-  }
-}
-
 /// ARTS TRANSFORM
-bool ARTSTransformer::run(FunctionAnalysisManager &FAM) {
+bool ARTSTransformer::run(ModuleAnalysisManager &AM) {
   bool Changed = false;
   /// The process start in the main function, we which will converted to an EDT.
   Function *MainF = M.getFunction("main");
@@ -1071,12 +1550,17 @@ bool ARTSTransformer::run(FunctionAnalysisManager &FAM) {
     LLVM_DEBUG(dbgs() << TAG << "Main function not found\n");
     return Changed;
   }
-
-  AnalysisGetter AG(FAM);
-  ARTSAnalyzer Analyzer(*this, FAM, AG);
+  insertEdt(EdtInfo::MAIN, MainF);
+  
+  ARTSAnalyzer Analyzer(*this, AM);
   Analyzer.identifyEDTs(*MainF);
   Analyzer.removeValues();
 
+  if(EdtFunctions.size() == 1) {
+    LLVM_DEBUG(dbgs() << TAG << "No EDTs were identified" <<  "\n");
+    return Changed;
+  }
+  LLVM_DEBUG(dbgs() << TAG << EdtFunctions.size() << " EDTs were identified" <<  "\n");
 
   /// Get the set of functions in the module
   SetVector<Function *> Functions;
@@ -1087,38 +1571,35 @@ bool ARTSTransformer::run(FunctionAnalysisManager &FAM) {
   }
 
   /// Create attributor
-  // CallGraphUpdater CGUpdater;
-  // BumpPtrAllocator Allocator;
-  // ARTSInformationCache InfoCache(M, AG, CGUpdater, Allocator, &Functions, *this);
-  // AttributorConfig AC(CGUpdater);
-  // AC.IsModulePass = true;
-  // AC.DefaultInitializeLiveInternals = true;
-  // AC.DeleteFns = true;
-  // AC.RewriteSignatures = false;
-  // AC.UseLiveness = true;
-  // AC.InitializationCallback = registerAAsForFunction;
-  // Attributor A(Functions, InfoCache, AC);
+  CallGraphUpdater CGUpdater;
+  BumpPtrAllocator Allocator;
+  ARTSInformationCache InfoCache(M, Analyzer.AG, CGUpdater, Allocator, &Functions, *this);
+  AttributorConfig AC(CGUpdater);
+  AC.IsModulePass = true;
+  AC.DefaultInitializeLiveInternals = true;
+  AC.DeleteFns = true;
+  AC.RewriteSignatures = false;
+  AC.UseLiveness = true;
+  Attributor A(Functions, InfoCache, AC);
 
+  // Run EDTAnalyzer on the main function
+  LLVM_DEBUG(dbgs() << TAG
+                    << "Initializing EDTAnalyzer attributor\n");
+   /// Analyze all EDT Functions
+  for(auto Itr : EdtFunctions) {
+    auto *F = Itr.first;
+    A.getOrCreateAAFor<EDTAnalyzer>(IRPosition::function(*F),
+                              /* QueryingAA */ nullptr, DepClassTy::NONE,
+                              /* ForceUpdate */ false,
+                              /* UpdateAfterInit */ true);
+  }
 
-  // /// Run AAToARTS on the main function
-  // LLVM_DEBUG(dbgs() << TAG
-  //                   << "Initializing AAToARTS attributor for main function\n");
-  //  /// Analyze data environment for CBs
-  // for(auto *CB : CBs) {
-  //   A.getOrCreateAAFor<AADataEnv>(
-  //     IRPosition::callsite_function(*CB),
-  //     /* QueryingAA */ nullptr,
-  //     DepClassTy::NONE,
-  //     /* ForceUpdate */ false,
-  //     /* UpdateAfterInit */ true);
-  // }
-  // // A.getOrCreateAAFor<AAToARTS>(IRPosition::function(*MainF),
-  // //                              /* QueryingAA */ nullptr, DepClassTy::NONE,
-  // //                              /* ForceUpdate */ false,
-  // //                              /* UpdateAfterInit */ true);
-  // Changed |= runAttributor(A);
+  Changed |= runAttributor(A);
 
-  LLVM_DEBUG(dbgs() << TAG << "\nEDTs INFORMATION\n");
+  /// Print collected Information
+  LLVM_DEBUG(dbgs() << "\n------------------------\n");
+  LLVM_DEBUG(dbgs() << "EDTs INFORMATION\n");
+  LLVM_DEBUG(dbgs() << TAG << EdtFunctions << "\n");
   // LLVM_DEBUG(dbgs() << TAG << EDTs << "\n");
   return Changed;
 }
@@ -1146,9 +1627,7 @@ PreservedAnalyses ARTSTransformPass::run(Module &M, ModuleAnalysisManager &AM) {
   bool Changed = false;
 
   ARTSTransformer AT(M);
-  FunctionAnalysisManager &FAM =
-      AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
-  Changed |= AT.run(FAM);
+  Changed |= AT.run(AM);
   
 
   /// Run ARTSTransform

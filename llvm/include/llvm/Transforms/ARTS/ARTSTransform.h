@@ -4,9 +4,11 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/PassManager.h"
 // #include "llvm/IR/Type.h"
 #include "llvm/Transforms/IPO/Attributor.h"
@@ -168,20 +170,41 @@ inline raw_ostream &operator<<(raw_ostream &OS, DataEnv &DE) {
   return OS;
 }
 
-/// EDT DEP 
+/// EDTs DEPENDENCIES 
+/// This struct represents a dependency between two Edts
+/// We may have different kind of dependencies: EVENTS or DATA DEPENDENCIES
+/// DATA DEPENDENCIES: For this kind of dependencies, we need to know the
+/// values that are going to be signaled to the successor Edt.
+/// EVENTS: For this kind of dependencies, we need to know the event that
+
 struct EdtInfo;
 struct EdtDep {
+  /// Type
+  enum Type { OTHER = 0, IN, OUT, INOUT };
   /// Interface 
-  EdtDep() : Edt(nullptr){};
-  EdtDep(EdtInfo *Edt) : Edt(Edt){};
-  // EdtDep(EdtInfo *Edt, DataEnv *DE) : Edt(Edt), DE(DE) {};
+  EdtDep(Type Ty, EdtInfo *Edt) : Ty(Ty), EdtTo(Edt){};
 
   /// Attributes 
+  /// Type of the dependency
+  Type Ty;
   // Edt where the value will be signaled to
-  EdtInfo *Edt;
+  EdtInfo *EdtTo;
   /// Values to be signaled
   SmallVector<Value *, 4> Values;
 };
+
+struct EventDep : public EdtDep {
+  /// Interface 
+  EventDep(EdtInfo *Edt, Value *Event) : EdtDep(Edt), Event(Event){};
+
+  /// Attributes 
+  /// Event to be signaled
+  Value *Event;
+};
+
+
+
+
 
 /// EDT INFO 
 /// Struct to store information about Edts. This is not an Edt itself,
@@ -190,11 +213,11 @@ struct EdtDep {
 /// by an EdtInfo object)
 struct EdtInfo {
   /// Type
-  enum Type{ TASK, PARALLEL, WRAPPER, OTHER };
+  enum Type{ TASK, PARALLEL, WRAPPER, OTHER, MAIN };
 
   /// Interface 
   EdtInfo(Type Ty, uint64_t ID) : Ty(Ty), ID(ID){};
-  EdtInfo(Type Ty, uint64_t ID, Function *F) : ID(ID), F(F){};
+  EdtInfo(Type Ty, uint64_t ID, Function *F) : Ty(Ty), ID(ID), F(F){};
 
   void setF(Function *F) { this->F = F; }
   Type getType() { return Ty; }
@@ -210,6 +233,18 @@ struct EdtInfo {
   DataEnv DE;
   /// Indicates if the Edt transformed to an ARTS Edt or not
   bool Transformed = false;
+  /// Predecessors
+  SetVector<EdtInfo *> Preds;
+  /// Successors
+  DenseMap<EdtInfo *, EdtDep *> Succs;
+
+  bool hasSharedVars() { return DE.Shareds.size() > 0; }
+
+  void insertDep(EdtDep::Type Ty, EdtInfo *Edt, Value *V) {
+    if (!Succs.count(Edt))
+      Succs[Edt] = new EdtDep(Ty, Edt);
+    Succs[Edt]->Values.push_back(V);
+  }
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS, EdtInfo &EI) {
@@ -230,9 +265,24 @@ inline raw_ostream &operator<<(raw_ostream &OS, EdtInfo &EI) {
   case EdtInfo::Type::OTHER:
     OS << "OTHER";
     break;
+  case EdtInfo::Type::MAIN:
+    OS << "MAIN";
+    break;
   }
   OS << "\n";
   OS << EI.DE;
+  OS << "Predecessors: " << EI.Preds.size() << "\n";
+  for (auto *Pred : EI.Preds)
+    OS << "  - " << Pred->ID << "\n";
+  OS << "Successors: " << EI.Succs.size() << "\n";
+  for (auto SuccItr : EI.Succs) {
+    auto *Succ = SuccItr.first;
+    auto *Dep = SuccItr.second;
+    OS << "  - " << Succ->ID << "\n";
+    OS << "    Values: " << Dep->Values.size() << "\n";
+    for (auto *V : Dep->Values)
+      OS << "      - " << *V << "\n";
+  }
   return OS;
 }
 
@@ -247,7 +297,7 @@ struct ARTSTransformer {
     //   delete (It.second);
     // EdtBlocks.clear();
   }
-  bool run(FunctionAnalysisManager &FAM);
+  bool run(ModuleAnalysisManager &AM);
   bool runAttributor(Attributor &A);
 
   /// Helper Functions 
@@ -255,35 +305,51 @@ struct ARTSTransformer {
   /// Create Edt
   EdtInfo *insertEdt(EdtInfo::Type Ty, Function *F) {
     EdtInfo *Edt = new EdtInfo(Ty, EdtItr++, F);
-    EdtTypeToFunction[Ty] = F;
-    EdtForFunction[F] = Edt;
+    // EdtTypeToFunction[Ty] = F;
+    EdtFunctions[F] = Edt;
     return Edt;
+  }
+
+  void insertEdtCall(CallBase *Call) {
+    auto *BB = Call->getParent();
+    EdtCalls[BB] = Call;
   }
 
   /// Get Edt
   EdtInfo *getEdt(Function *F) {
-    if (EdtForFunction.count(F))
-      return EdtForFunction[F];
+    if (EdtFunctions.count(F))
+      return EdtFunctions[F];
+    return nullptr;
+  }
+
+  EdtInfo *getEdt(CallBase *Call) {
+    auto *F = Call->getCalledFunction();
+    return getEdt(F);
+  }
+
+  EdtInfo *getEdt(BasicBlock *BB) {
+    auto *Call = getEdtCall(BB);
+    if (Call)
+      return getEdt(Call);
+    return nullptr;
+  }
+
+  /// Get the Edt that is called in a BasicBlock
+  CallBase *getEdtCall(BasicBlock *BB) {
+    if (EdtCalls.count(BB))
+      return EdtCalls[BB];
     return nullptr;
   }
 
   /// Insert Type for Argument
   void insertArgToDE(Argument *Arg, DataEnv::Type Type,  DataEnv &DE) {
     DE.insertValue(Arg, Type);
-    TypeForArg[Arg] = Type;
   }
 
   void insertArgToDE(Argument *Arg, DataEnv::Type Type, EdtInfo &Edt) {
     insertArgToDE(Arg, Type, Edt.DE);
   }
 
-  /// Get Argument Type
-  DataEnv::Type getType(Argument *Arg) {
-    if (TypeForArg.count(Arg))
-      return TypeForArg[Arg];
-    return DataEnv::Type::NONE;
-  }
-  
 
   /// Attributes 
   /// The underlying module.
@@ -291,21 +357,20 @@ struct ARTSTransformer {
 
   /// Edt Counter
   uint64_t EdtItr = 0;
-  /// Maps the EdtType to the function
-  DenseMap<uint8_t, Function *> EdtTypeToFunction;
   /// Maps the Function to the EdtInfo that represents it
-  DenseMap<Function *, EdtInfo *> EdtForFunction;
-  /// Maps a Function Argument to a DataEnvironment Type
-  DenseMap<Argument *, DataEnv::Type> TypeForArg;
+  DenseMap<Function *, EdtInfo *> EdtFunctions;
+  /// Maps the BasicBlock to the an EdtCall
+  DenseMap<BasicBlock *, CallBase *> EdtCalls;
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS,
-                               SmallPtrSet<EdtInfo *, 4> &Edts) {
-  OS << "DUMPING Edts\n";
-  // OS << "Number of Edts: " << Edts.size() << "\n";
-  // for (auto *E : Edts) {
-  //   OS << "\n" << *E;
-  // }
+                               DenseMap<Function *, EdtInfo *> Edts) {
+  OS << "Dumping Edts\n";
+  OS << "Number of Edts: " << Edts.size() << "\n";
+  for (auto EdtItr : Edts) {
+    auto *E = EdtItr.second;
+    OS << "\n" << *E;
+  }
   return OS;
 }
 
