@@ -747,29 +747,6 @@ struct DenseMapInfo<AAPointerInfo::Access> : DenseMapInfo<Instruction *> {
   static bool isEqual(const Access &LHS, const Access &RHS);
 };
 
-/// Helper that allows RangeTy as a key in a DenseMap.
-template <> struct DenseMapInfo<AA::RangeTy> {
-  static inline AA::RangeTy getEmptyKey() {
-    auto EmptyKey = DenseMapInfo<int64_t>::getEmptyKey();
-    return AA::RangeTy{EmptyKey, EmptyKey};
-  }
-
-  static inline AA::RangeTy getTombstoneKey() {
-    auto TombstoneKey = DenseMapInfo<int64_t>::getTombstoneKey();
-    return AA::RangeTy{TombstoneKey, TombstoneKey};
-  }
-
-  static unsigned getHashValue(const AA::RangeTy &Range) {
-    return detail::combineHashValue(
-        DenseMapInfo<int64_t>::getHashValue(Range.Offset),
-        DenseMapInfo<int64_t>::getHashValue(Range.Size));
-  }
-
-  static bool isEqual(const AA::RangeTy &A, const AA::RangeTy B) {
-    return A == B;
-  }
-};
-
 /// Helper for AA::PointerInfo::Access DenseMap/Set usage ignoring everythign
 /// but the instruction
 struct AccessAsInstructionInfo : DenseMapInfo<Instruction *> {
@@ -855,7 +832,7 @@ struct AA::PointerInfo::State : public AbstractState {
   AAPointerInfo::const_bin_iterator end() const { return OffsetBins.end(); }
   int64_t numOffsetBins() const { return OffsetBins.size(); }
 
-  const AAPointerInfo::Access &getAccess(unsigned Index) const {
+  AAPointerInfo::Access getAccess(unsigned Index) const {
     return AccessList[Index];
   }
 
@@ -1081,6 +1058,9 @@ struct AAPointerInfoImpl
   virtual const_bin_iterator end() const override { return State::end(); }
   virtual int64_t numOffsetBins() const override {
     return State::numOffsetBins();
+  }
+  virtual AAPointerInfo::Access getAccess(unsigned Index) const override {
+    return State::getAccess(Index);
   }
 
   bool forallInterferingAccesses(

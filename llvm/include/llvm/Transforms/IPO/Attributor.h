@@ -475,6 +475,30 @@ struct DenseMapInfo<const AA::InstExclusionSetTy *>
   }
 };
 
+
+/// Helper that allows RangeTy as a key in a DenseMap.
+template <> struct DenseMapInfo<AA::RangeTy> {
+  static inline AA::RangeTy getEmptyKey() {
+    auto EmptyKey = DenseMapInfo<int64_t>::getEmptyKey();
+    return AA::RangeTy{EmptyKey, EmptyKey};
+  }
+
+  static inline AA::RangeTy getTombstoneKey() {
+    auto TombstoneKey = DenseMapInfo<int64_t>::getTombstoneKey();
+    return AA::RangeTy{TombstoneKey, TombstoneKey};
+  }
+
+  static unsigned getHashValue(const AA::RangeTy &Range) {
+    return detail::combineHashValue(
+        DenseMapInfo<int64_t>::getHashValue(Range.Offset),
+        DenseMapInfo<int64_t>::getHashValue(Range.Size));
+  }
+
+  static bool isEqual(const AA::RangeTy &A, const AA::RangeTy B) {
+    return A == B;
+  }
+};
+
 /// The value passed to the line option that defines the maximal initialization
 /// chain length.
 extern unsigned MaxInitializationChainLength;
@@ -6122,6 +6146,7 @@ struct AAPointerInfo : public AbstractAttribute {
   virtual const_bin_iterator begin() const = 0;
   virtual const_bin_iterator end() const = 0;
   virtual int64_t numOffsetBins() const = 0;
+  virtual Access getAccess(unsigned Index) const = 0;
 
   /// Call \p CB on all accesses that might interfere with \p Range and return
   /// true if all such accesses were known and the callback returned true for
